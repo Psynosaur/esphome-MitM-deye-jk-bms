@@ -1,5 +1,5 @@
-# mitpylon
-Man In The Middle Adapter For Pylontech Communction Protocol
+# MitM Deye
+Man In The Middle Adapter For Deye Communction Protocol
 
 # WARNING
 I'm not responsible for any damaged caused by this software.
@@ -7,7 +7,7 @@ I'm not responsible for any damaged caused by this software.
 Use it at your own risk!
 
 # Idea behind it
-A lot of BMSes talk Pylontech Protocol to Inverter.
+A lot of BMSes talk Pylontech Protocol to Inverter and Deye has their own flavour
 
 It's interesting to read values to show it in a SmartHome System like Home Assistant.
 
@@ -25,10 +25,12 @@ This ESPHome YAML reads CAN messages from BMS on one CAN-interface and resends (
 - Control SoC 100% (don't send 100% to inverter until float voltage state is reached)
 
 # Limitations
-Only this messages of original Pylontech Protocol are sopported:
-0x351, 0x355, 0x356, 0x359, 0x35c, 0x35e
+Only this messages of original Pylontech Protocol are supported:
 
-# Requirments
+    0x351, 0x355, 0x356, 0x359, 0x35c, 0x35e
+## We will add support for deye batteries in this fork
+
+# Requierments ESP32 and MCP2515
 This YAML was tested on ESP32 C6 with 2 CAN-Bus transceiver and modified ESPHome esp32_can component, to handle 2x internal CAN-busses
 
 ![Connection diagram](connection.png "Connection diagram")
