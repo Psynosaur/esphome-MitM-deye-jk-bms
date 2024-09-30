@@ -18,25 +18,46 @@ substitutions:
   offset_voltage: "0.5"
 
 #BMS specific:
-  charge_current: "150"
-  discharge_current: "150"
+  charge_current: "95"
+  discharge_current: "95"
 
 
 esphome:
   name: ${name}
   friendly_name: ${name}
   comment: ${device_description}
-  min_version: 2024.7.0 # for ESP32 C6
+  # min_version: 2024.7.0 # for ESP32 C6
+
+# esp32:
+#   board: featheresp32
+#   framework:
+#     type: arduino
 
 esp32:
-  board: esp32dev
+# ESP32 C6
+  board: esp32-c6-devkitc-1
+  flash_size: 8MB
+  variant: esp32c6
   framework:
-    type: arduino
-
+    type: esp-idf
+    version: "5.2.2"
+    platform_version: 6.6.0
+    sdkconfig_options:
+      CONFIG_OPENTHREAD_ENABLED: n
+      CONFIG_ENABLE_WIFI_STATION: y
+      CONFIG_USE_MINIMAL_MDNS: y
+      CONFIG_ESPTOOLPY_FLASHSIZE_8MB: y
+      CONFIG_ESP_CONSOLE_USB_CDC: y
+      
+# for ESP32 C6 only because of two CAN-busses
+external_components:
+  - source: github://Adminius/esphome@multiple_can_esp32
+    components: [ esp32_can ]
+#    refresh: 60s
 # Enable logging
 logger:
   baud_rate: 0 # disable UART logger
-  level: WARN
+  level: INFO
 
 # Enable webserver
 web_server:
@@ -106,33 +127,19 @@ time:
           id(force100soc) = true;
 
 # for MCP2515
-spi:
- miso_pin: GPIO01
- mosi_pin: GPIO05
- clk_pin: GPIO09
+# spi:
+#  miso_pin: GPIO27
+#  mosi_pin: GPIO26
+#  clk_pin: GPIO25
 
 canbus:
 
 # inverter
 # ESP32 C6:
-  # - platform: esp32_can
-  #   id: inverter
-  #   tx_pin: GPIO03
-  #   rx_pin: GPIO02
-  #   can_id: 100
-  #   bit_rate: 500KBPS
-  #   on_frame:
-  #   - can_id: 0x305
-  #     then:
-  #       - lambda: |-
-  #           id(can305Counter) = 0;  //inverter is connected
-  #           id(inverter_connected).publish_state(true);
-#            ESP_LOGI("main", "received can id: 0x305 ACK");
-
-# NOT TESTED:
-  - platform: mcp2515
+  - platform: esp32_can
     id: inverter
-    cs_pin: GPIO10
+    tx_pin: GPIO01
+    rx_pin: GPIO00
     can_id: 100
     bit_rate: 500KBPS
     on_frame:
@@ -141,14 +148,32 @@ canbus:
         - lambda: |-
             id(can305Counter) = 0;  //inverter is connected
             id(inverter_connected).publish_state(true);
-  #            ESP_LOGI("main", "received can id: 0x305 ACK");
+            ESP_LOGI("main", "received can id: 0x305 ACK");
+
+# NOT TESTED:
+  # - platform: esp32_can
+  #   id: bms
+  #   tx_pin: GPIO32 # CAN HIGH BLUE
+  #   rx_pin: GPIO39 # CAN LOW LIGHT BLUE
+  #   can_id: 100
+  #   bit_rate: 500KBPS
+  #   on_frame:
+  #   - can_id: 0x305
+  #     then:
+  #       - lambda: |-
+  #           id(can305Counter) = 0;  //inverter is connected
+  #           id(inverter_connected).publish_state(true);
+  #           ESP_LOGI("main", "received can id: 0x305 ACK");
 
 
 # BMS
+  # - platform: mcp2515
+  #   id: inverter
+  #   cs_pin: GPIO33
   - platform: esp32_can
     id: bms
-    tx_pin: GPIO03
-    rx_pin: GPIO02
+    tx_pin: GPIO02
+    rx_pin: GPIO03
     can_id: 200
     bit_rate: 500KBPS
     on_frame:
@@ -181,6 +206,7 @@ canbus:
             canMessage[1] = (uint8_t)(chargeVoltage >> 8);
             canMessage[6] = 0x1A; //Discharge voltage 41.6V => 2.6V per cell
             canMessage[7] = 0x01; //Discharge voltage 41.6V
+            
             if((id(charge_to_90_only).state == true && id(battery_soc).state >= 90 && !id(force100soc)) || !id(charging_allowed).state || !id(set_charging_allowed).state){
               /* if charging is not allowed, set current to 0, Deye don't like 0 and start discharging, so set to 1 amp (0x0A / 10 = 1A)  */
               canMessage[2] = 0x0A;
@@ -195,6 +221,7 @@ canbus:
                 canMessage[3] = (uint8_t)x[3];
               }
             }
+
             if(!id(charging_allowed).state || !id(set_charging_allowed).state) {
               /* if charging is not allowed, set current to 0*/
               canMessage[4] = 0x00;
@@ -306,6 +333,10 @@ canbus:
             //std::vector< uint8_t > data{0x50, 0x59, 0x4C, 0x4F, 0x4E, 0x00, 0x00, 0x00};
             id(inverter)->send_data(can_id, false, x);
             //ESP_LOGI("canid 0x35E:", "%02x %02x %02x %02x %02x %02x %02x %02x", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]); 
+    - can_id: 0x356
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
     - can_id: 0x361
       then:
         - lambda: |-
@@ -342,6 +373,108 @@ canbus:
             //id(battery_charge_current_limit_deye).publish_state(i_charge);
             //int i_discharge = ((x[3] << 8) | x[2]) / 10;
             //id(battery_discharge_current_limit_deye).publish_state(i_discharge);
+    - can_id: 0x110 
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x111 
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);  
+
+    - can_id: 0x150 
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+
+    - can_id: 0x151 
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+
+    - can_id: 0x200 
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    
+    - can_id: 0x201 
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+
+    - can_id: 0x250
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x251 
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x400 
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x401 
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x110 
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x111 
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x500
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x501 
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x550
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+
+    - can_id: 0x551
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x600
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x601 
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x650
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x651 
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x700
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x701 
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x750
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x751 
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
 
 # send messages
 interval:
@@ -507,7 +640,7 @@ number:
   - platform: template
     name: "Charge voltage override"
     id: "charge_voltage_override"
-    unit_of_measurement: 'A'
+    unit_of_measurement: 'V'
     device_class: 'voltage'
     max_value: 58.4
     min_value: 54.0
