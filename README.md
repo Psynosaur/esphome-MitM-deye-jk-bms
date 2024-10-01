@@ -7,13 +7,13 @@ I'm not responsible for any damaged caused by this software.
 Use it at your own risk!
 
 # Idea behind it
-A lot of BMSes talk Pylontech Protocol to Inverter and Deye has their own flavour
+Deye BMS does not allow setting request charge voltage, it is 58.4V always.
 
-It's interesting to read values to show it in a SmartHome System like Home Assistant.
+We intercept the message and change it to a value of our liking.
 
-But sometimes it is also useful to modify some values, like charging current or voltage.
+We also can change current limits without using the RS485 on inverter.
 
-This ESPHome YAML reads CAN messages from BMS on one CAN-interface and resends (modified) messages to an inverter on the second CAN interface.
+The rest of the frames are just passed on for each battery in my 2 pack array.
 
 # Features
 - Modify charge current: from 0 amps to the values that BMS allows
@@ -25,16 +25,21 @@ This ESPHome YAML reads CAN messages from BMS on one CAN-interface and resends (
 - Control SoC 100% (don't send 100% to inverter until float voltage state is reached)
 
 # Limitations
-Only this messages of original Pylontech Protocol are supported:
+We only modify these frames
 
-    0x351, 0x355, 0x356, 0x359, 0x35c, 0x35e
-## We will add support for deye batteries in this fork
-
-# Requierments ESP32 and MCP2515
+    0x351, 0x355
+    
+# Requierments 
+    - ESP32 C6
+    - MCP2515 if not using ESP32 C6
+    - CAN transceiver boards
+        - 5V => TJA1050 CAN transciever boards with a 4k7Ω resistor on RX pint to ESP32
+        - 3.3V => SN65HVD230 VP230 
+        
 This YAML was tested on ESP32 C6 with 2 CAN-Bus transceiver and modified ESPHome esp32_can component, to handle 2x internal CAN-busses
 
 ![Connection diagram](connection.png "Connection diagram")
 
-It should be possible to use any ESP32 with one CAN-Bus transceiver and one MCP2515 SPI CAN-Controller (not tested)
+It should be possible to use any ESP32 with one CAN-Bus transceiver and one MCP2515 SPI CAN-Controller
 
-Tested with JK Inverter BMS and Deye SUN12K Inverter
+Tested with Deye SE-G5.1 Pro BMS and Deye SUN8K single phase inverter
