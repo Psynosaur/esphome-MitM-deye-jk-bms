@@ -1,14 +1,7 @@
-# Man In The (middle) Pylon
-# Read Pylontech Protocol from BMS and send to inverter with some modifications
+# Man In The (middle) Deye
+# Read Deye protocol from BMS and send to inverter with some modifications
 
-# Based on great work:
-# https://github.com/syssi/esphome-jk-bms
-# https://github.com/Uksa007/esphome-jk-bms-can
-# https://github.com/Ackmaniac/esphome-jk-bms-can
-# https://github.com/Sleeper85/esphome-jk-bms-can
-
-
-
+# Thanks to Adminius
 
 substitutions:
   name: mitm-deye
@@ -192,9 +185,9 @@ canbus:
             // Attention!!! if RCV will be changed to lower voltage in BMS, reboot of mitpylon device is necessary!!!
             if(id(saveRcv) < u_max) id(saveRcv) = id(charge_voltage_override).state; 
             uint16_t chargeCurrent = ((x[3] << 8) | x[2]) / 10;
-            id(battery_charge_current_limit).publish_state(chargeCurrent);
+            id(battery_charge_current_limit).publish_state(chargeCurrent / 10);
             uint16_t dischargeCurrent = ((x[5] << 8) | x[4]) / 10;
-            id(battery_discharge_current_limit).publish_state(dischargeCurrent);
+            id(battery_discharge_current_limit).publish_state(dischargeCurrent / 10);
             //for(uint8_t i = 0; i < 8; i++){ id(can351)[i] = x[i]; }
             //if(!id(initDone)) id(initDone) = true;
             id(noBmsUpdateCounter) = 0;  //bms is connected
@@ -206,7 +199,7 @@ canbus:
             canMessage[1] = (uint8_t)(chargeVoltage >> 8);
             canMessage[6] = 0x1A; //Discharge voltage 41.6V => 2.6V per cell
             canMessage[7] = 0x01; //Discharge voltage 41.6V
-            
+
             if((id(charge_to_90_only).state == true && id(battery_soc).state >= 90 && !id(force100soc)) || !id(charging_allowed).state || !id(set_charging_allowed).state){
               /* if charging is not allowed, set current to 0, Deye don't like 0 and start discharging, so set to 1 amp (0x0A / 10 = 1A)  */
               canMessage[2] = 0x0A;
@@ -235,8 +228,9 @@ canbus:
             canMessage[5] = (uint8_t)(dischargeCurrent >> 8);
             //ESP_LOGI("canid 0x351:", "%02x %02x %02x %02x %02x %02x %02x %02x", canMessage[0], canMessage[1], canMessage[2], canMessage[3], canMessage[4], canMessage[5], canMessage[6], canMessage[7]);
             std::vector< uint8_t > data{canMessage[0], canMessage[1], canMessage[2], canMessage[3], canMessage[4], canMessage[5], canMessage[6], canMessage[7]};
+            //std::vector< uint8_t > data{canMessage[0], canMessage[1], canMessage[2], canMessage[3], x[4], x[5], canMessage[6], canMessage[7]};
             id(inverter)->send_data(can_id, false, data);
-          #  ESP_LOGI("canid 0x351:", "U_max: %.1f V, I_charge %d A, I_discharge: %d A", u_max, chargeCurrent, dischargeCurrent);
+            ESP_LOGI("canid 0x351:", "U_max: %.1f V, I_charge %d A, I_discharge: %d A", u_max, chargeCurrent / 10, dischargeCurrent / 10);
 
     - can_id: 0x355
       then:
