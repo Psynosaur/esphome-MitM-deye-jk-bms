@@ -29,7 +29,7 @@ We only modify these frames
 
     0x351, 0x355
     
-# Requierments 
+# Requirements 
     - ESP32 C6
     - MCP2515 if not using ESP32 C6
     - CAN transceiver boards
