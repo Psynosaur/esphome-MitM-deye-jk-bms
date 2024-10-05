@@ -1,13 +1,25 @@
-# Man In The (middle) Pylon
-# Read Pylontech Protocol from BMS and send to inverter with some modifications
+# Man In The (middle) Deye
 
-# Based on great work:
-# https://github.com/syssi/esphome-jk-bms
-# https://github.com/Uksa007/esphome-jk-bms-can
-# https://github.com/Ackmaniac/esphome-jk-bms-can
-# https://github.com/Sleeper85/esphome-jk-bms-can
+## POC for balancing
+# new global variables:
+# bool balancing1 = false;
+# bool balancing = false;
 
 
+# 0x400:
+# if (x[3] != 0x00 || x[4] != 0x00) id(balancing1) = true else id(balancing1) = false;
+# 0x401:
+# if (x[3] != 0x00 || x[4] != 0x00 || id(balancing1)) id(balancing) = true else id(balancing) = false;
+
+# 0x351
+# uint8_t target_charge_current_limit = id(battery_charge_current_limit);
+# if id(battery_max_cell_voltage_deye).state < 3.35 && id(battery_max_cell_voltage_deye).state <= 3.40 id(target_charge_current_limit).publish_state(battery_charge_current_limit / 2);
+# if id(battery_max_cell_voltage_deye).state > 3.40 and id(balancing) == true target_charge_current_limit = 20;
+# if id(battery_max_cell_voltage_deye).state > 3.43 and id(balancing) == true target_charge_current_limit = 10;
+# if id(battery_max_cell_voltage_deye).state > 3.45 and id(balancing) == true target_charge_current_limit = 5;
+# if id(battery_max_cell_voltage_deye).state > 3.50 and id(balancing) == true target_charge_current_limit = 3;
+# if id(battery_max_cell_voltage_deye).state > 3.55 and id(balancing) == true target_charge_current_limit = 2;
+# write to can: target_charge_current_limit * 10
 
 
 substitutions:
@@ -15,11 +27,11 @@ substitutions:
   device_description: "Man In The Middle Adapter For Deye Communication Protocol"
 
 # voltage offset for inverter to compensate voltage drop in cabling or to force inverter (e.g. Deye) to go higher with a voltage to reach charge voltage level
-  offset_voltage: "0.5"
+  offset_voltage: "0.4"
 
 #BMS specific:
-  charge_current: "95"
-  discharge_current: "95"
+  charge_current: "120"
+  discharge_current: "120"
 
 
 esphome:
@@ -201,7 +213,7 @@ canbus:
             id(bms_connected).publish_state(true);
 
             uint8_t canMessage[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-            uint16_t chargeVoltage = (uint16_t)((id(charge_voltage_override).state + id(charge_voltage_offset).state) * 10);
+            uint16_t chargeVoltage = (uint16_t)((id(charge_voltage_override).state - id(charge_voltage_offset).state) * 10);
             canMessage[0] = (uint8_t)(chargeVoltage & 0xFF);
             canMessage[1] = (uint8_t)(chargeVoltage >> 8);
             canMessage[6] = 0x1A; //Discharge voltage 41.6V => 2.6V per cell
@@ -291,7 +303,7 @@ canbus:
         - lambda: |-
             float voltage = ((x[1] << 8) | x[0]) / 100.0;
             id(battery_voltage).publish_state(voltage);
-            float current = ((x[3] << 8) | x[2]) / 10;
+            float current = ((x[3] << 8) | x[2]) / 10.0;
             if(x[3] > 0x80) current = uint16_t(~((x[3] << 8) | x[2]) + 1) / -10.0;
             id(battery_current).publish_state(current);
             float temperature = ((x[5] << 8) | x[4]) / 10;
@@ -679,3 +691,6 @@ switch:
     id: "soc_100_rcv_rfv_control"
     optimistic: True
     restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: restart
+    name: "Restart MitM-Deye"
