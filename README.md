@@ -1,4 +1,4 @@
-![image](https://github.com/user-attachments/assets/e3a01b38-234d-4642-9fd3-06a2a800433b)# MitM Deye
+# MitM Deye
 Man In The Middle Adapter For Deye Communction Protocol
 
 # WARNING
@@ -43,8 +43,8 @@ This YAML was tested on ESP32 C6 with 2 CAN-Bus transceiver and modified ESPHome
 Tested with Deye SE-G5.1 Pro BMS and Deye SUN8K single phase inverter
 
 ## Home assistant:
-![mitm](https://i.imgur.com/u6WZCEs.png)
 ![mitm2](https://i.imgur.com/rx5Eb2X.png)
+![mitm](https://i.imgur.com/u6WZCEs.png)
 
 ## Plans:
   - Build JK battery...
