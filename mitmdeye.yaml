@@ -216,12 +216,15 @@ canbus:
             uint16_t chargeVoltage = (uint16_t)((id(charge_voltage_override).state - id(charge_voltage_offset).state) * 10);
             canMessage[0] = (uint8_t)(chargeVoltage & 0xFF);
             canMessage[1] = (uint8_t)(chargeVoltage >> 8);
-            canMessage[6] = 0x1A; //Discharge voltage 41.6V => 2.6V per cell
-            canMessage[7] = 0x01; //Discharge voltage 41.6V
+            //canMessage[6] = 0x1A; //Discharge voltage 41.6V => 2.6V per cell
+            //canMessage[7] = 0x01; //Discharge voltage 41.6V
+            canMessage[6] = x[6];
+            canMessage[7] = x[7]; 
 
             if((id(charge_to_90_only).state == true && id(battery_soc).state >= 90 && !id(force100soc)) || !id(charging_allowed).state || !id(set_charging_allowed).state){
               /* if charging is not allowed, set current to 0, Deye don't like 0 and start discharging, so set to 1 amp (0x0A / 10 = 1A)  */
-              canMessage[2] = 0x0A;
+              // canMessage[2] = 0x0A;
+              canMessage[2] = 0x00;
               canMessage[3] = 0x00;
             }else{
               if(id(set_charge_current_limit).state <= chargeCurrent) { 
@@ -238,13 +241,17 @@ canbus:
               /* if charging is not allowed, set current to 0*/
               canMessage[4] = 0x00;
               canMessage[5] = 0x00;
-            }else{
-              if(id(set_discharge_current_limit).state <= dischargeCurrent) {
-                dischargeCurrent = (uint16_t)(id(set_discharge_current_limit).state) * 10;
-              }
             }
-            canMessage[4] = (uint8_t)(dischargeCurrent & 0xFF);
-            canMessage[5] = (uint8_t)(dischargeCurrent >> 8);
+            if(id(set_discharge_current_limit).state <= dischargeCurrent) {
+                dischargeCurrent = (uint16_t)(id(set_discharge_current_limit).state) * 10;
+                canMessage[4] = (uint8_t)(dischargeCurrent & 0xFF);
+                canMessage[5] = (uint8_t)(dischargeCurrent >> 8);
+            }
+            else{
+                canMessage[4] = x[4];
+                canMessage[5] = x[5];
+            }
+            
             //ESP_LOGI("canid 0x351:", "%02x %02x %02x %02x %02x %02x %02x %02x", canMessage[0], canMessage[1], canMessage[2], canMessage[3], canMessage[4], canMessage[5], canMessage[6], canMessage[7]);
             std::vector< uint8_t > data{canMessage[0], canMessage[1], canMessage[2], canMessage[3], canMessage[4], canMessage[5], canMessage[6], canMessage[7]};
             //std::vector< uint8_t > data{canMessage[0], canMessage[1], canMessage[2], canMessage[3], x[4], x[5], canMessage[6], canMessage[7]};
@@ -314,23 +321,65 @@ canbus:
 
     - can_id: 0x35C
       then:
-        - lambda: |-
+         - lambda: |-
+            // Original state reporting remains
             id(charging_allowed).publish_state(x[0] & 0x80);
             id(discharging_allowed).publish_state(x[0] & 0x40);
             id(request_force_charge_1).publish_state(x[0] & 0x20);
             id(request_force_charge_2).publish_state(x[0] & 0x10);
             id(request_full_charge).publish_state(x[0] & 0x08);
-            // for(uint8_t i = 0; i < 8; i++){ id(can35c)[i] = x[i]; }
+
             uint8_t message = 0x00;
-            if(id(charging_allowed).state && id(set_charging_allowed).state) message = 0x80;
-            if(id(discharging_allowed).state && id(set_discharging_allowed).state) message = message | 0x40;
-            if(id(request_force_charge_1).state || id(set_charge_request).state) message = message | 0x20;
-            if(id(request_force_charge_2).state) message = message | 0x10;
-            if(id(request_full_charge).state) message = message | 0x08;
-            //ESP_LOGI("canid 0x35C:", "%02x", message);
-            std::vector< uint8_t > data{ message, x[1], x[2], x[3], x[4], x[5], x[6], x[7]};
-            id(inverter)->send_data(can_id, false, data);
-            //ESP_LOGI("canid 0x35C:", "%02x %02x %02x %02x %02x %02x %02x %02x", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]);    
+            
+            // Preserve charging/discharging allowed states
+            if(id(charging_allowed).state && id(set_charging_allowed).state) message |= 0x80;
+            if(id(discharging_allowed).state && id(set_discharging_allowed).state) message |= 0x40;
+
+            // Force Charge 1 handling
+            if(id(block_bms_force_charge_1).state) {
+              // Completely block BMS's Force Charge 1, use override
+              if(id(override_force_charge_1).state) message |= 0x20;
+            } else {
+              // Normal operation: BMS value or override
+              if(id(override_force_charge_1).state || (x[0] & 0x20)) message |= 0x20;
+            }
+
+            // Force Charge 2 handling
+            if(id(block_bms_force_charge_2).state) {
+              // Completely block BMS's Force Charge 2, use override
+              if(id(override_force_charge_2).state) message |= 0x10;
+            } else {
+              // Normal operation: BMS value or override
+              if(id(override_force_charge_2).state || (x[0] & 0x10)) message |= 0x10;
+            }
+
+            // Preserve full charge request
+            if(x[0] & 0x08) message |= 0x08;
+
+            // Only send message if either:
+            // 1. We're not blocking both force charges, OR
+            // 2. There's other important data to send
+            if(message != 0 || (x[1] != 0 || x[2] != 0 || x[3] != 0 || x[4] != 0 || x[5] != 0 || x[6] != 0 || x[7] != 0)) {
+              std::vector< uint8_t > data{message, x[1], x[2], x[3], x[4], x[5], x[6], x[7]};
+              id(inverter)->send_data(can_id, false, data);
+            }
+        # - lambda: |-
+        #     id(charging_allowed).publish_state(x[0] & 0x80);
+        #     id(discharging_allowed).publish_state(x[0] & 0x40);
+        #     id(request_force_charge_1).publish_state(x[0] & 0x20);
+        #     id(request_force_charge_2).publish_state(x[0] & 0x10);
+        #     id(request_full_charge).publish_state(x[0] & 0x08);
+        #     // for(uint8_t i = 0; i < 8; i++){ id(can35c)[i] = x[i]; }
+        #     uint8_t message = 0x00;
+        #     if(id(charging_allowed).state && id(set_charging_allowed).state) message = 0x80;
+        #     if(id(discharging_allowed).state && id(set_discharging_allowed).state) message = message | 0x40;
+        #     if(id(request_force_charge_1).state || id(set_charge_request).state) message = message | 0x20;
+        #     if(id(request_force_charge_2).state) message = message | 0x10;
+        #     if(id(request_full_charge).state) message = message | 0x08;
+        #     if(message != 192) ESP_LOGI("canid 0x35C:", "%02x", message);
+        #     std::vector< uint8_t > data{ message, x[1], x[2], x[3], x[4], x[5], x[6], x[7]};
+        #     id(inverter)->send_data(can_id, false, data);
+        #     //ESP_LOGI("canid 0x35C:", "%02x %02x %02x %02x %02x %02x %02x %02x", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]);    
     
     - can_id: 0x359
       then:
@@ -656,12 +705,37 @@ number:
     unit_of_measurement: 'V'
     device_class: 'voltage'
     max_value: 58.4
-    min_value: 54.0
+    min_value: 53.0
     step: 0.1
     optimistic: True
     restore_value: True
 
 switch:
+    # Add these new switches
+  - platform: template
+    name: "Block BMS Force Charge 1"
+    id: "block_bms_force_charge_1"
+    optimistic: True
+    restore_mode: ALWAYS_OFF
+
+  - platform: template
+    name: "Block BMS Force Charge 2"
+    id: "block_bms_force_charge_2"
+    optimistic: True
+    restore_mode: ALWAYS_OFF
+
+  - platform: template
+    name: "Override Force Charge 1"
+    id: "override_force_charge_1"
+    optimistic: True
+    restore_mode: ALWAYS_OFF
+
+  - platform: template
+    name: "Override Force Charge 2"
+    id: "override_force_charge_2"
+    optimistic: True
+    restore_mode: ALWAYS_OFF
+
   - platform: template
     name: "Set charging allowed"
     id: "set_charging_allowed"
