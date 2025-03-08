@@ -41,3 +41,13 @@ This YAML was tested on ESP32 C6 with 2 CAN-Bus transceiver and modified ESPHome
 ![Connection diagram](connection.png "Connection diagram")
 
 Tested with Deye SE-G5.1 Pro BMS and Deye SUN8K single phase inverter
+
+## Home assistant:
+![mitm2](https://i.imgur.com/rx5Eb2X.png)
+![mitm](https://i.imgur.com/u6WZCEs.png)
+
+## Plans:
+  - Build JK battery...
+  - Add JK inverter BMS into the mix: 
+    - 2xDeye - 200Ah 
+    - 1xJK200A - 280Ah (CAN/RS485)
