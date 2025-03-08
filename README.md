@@ -44,7 +44,7 @@ Tested with Deye SE-G5.1 Pro BMS and Deye SUN8K single phase inverter
 
 ## Home assistant:
 ![mitm2](https://i.imgur.com/rx5Eb2X.png)
-![mitm](https://i.imgur.com/u6WZCEs.png)
+![mitm](https://i.imgur.com/EDk8vfV.png)
 
 ## Plans:
   - Build JK battery...
