@@ -187,15 +187,17 @@ canbus:
         - lambda: |-
             float u_max = ((x[1] << 8) | x[0]) / 10.0;
             id(battery_charge_voltage).publish_state(u_max); // 58.4V
+
             // assume, that the highest voltage is RCV! 
             // Attention!!! if RCV will be changed to lower voltage in BMS, reboot of mitpylon device is necessary!!!
             if(id(saveRcv) < u_max) id(saveRcv) = id(charge_voltage_override).state; 
+
             uint16_t chargeCurrent = ((x[3] << 8) | x[2]) / 10;
             id(battery_charge_current_limit).publish_state(chargeCurrent);
+
             uint16_t dischargeCurrent = ((x[5] << 8) | x[4]) / 10;
             id(battery_discharge_current_limit).publish_state(dischargeCurrent);
-            //for(uint8_t i = 0; i < 8; i++){ id(can351)[i] = x[i]; }
-            //if(!id(initDone)) id(initDone) = true;
+
             id(noBmsUpdateCounter) = 0;  //bms is connected
             id(bms_connected).publish_state(true);
 
@@ -205,26 +207,30 @@ canbus:
             canMessage[0] = chargeVoltage & 0xFF;
             canMessage[1] = chargeVoltage >> 8;
 
+            // Lower charge limit if slider value is lower than `chargeCurrent`
             if(id(set_charge_current_limit).state <= chargeCurrent) { 
               chargeCurrent = (uint16_t)(id(set_charge_current_limit).state) * 10; 
               canMessage[2] = (uint8_t)(chargeCurrent & 0xFF);
               canMessage[3] = (uint8_t)(chargeCurrent >> 8);
-            }else{
-              // Determine charge-current bytes
-              if (id(use_charge_current_override).state) {
-                // scale slider (A → raw) and split into LSB/MSB
-                uint16_t oc = (uint16_t)(id(set_charge_current_limit).state * 10);
-                canMessage[2] = oc & 0xFF;
-                canMessage[3] = oc >> 8;
-                ESP_LOGI("0x371", "Override active - sending %u (raw)", oc);
-              }
             }
 
+            // Modify charge current sent to inverter if override is enabled
+            if (id(use_charge_current_override).state) {
+              // scale slider (A → raw) and split into LSB/MSB
+              uint16_t oc = (uint16_t)(id(set_charge_current_limit).state * 10);
+              canMessage[2] = oc & 0xFF;
+              canMessage[3] = oc >> 8;
+              ESP_LOGI("0x371", "Override active - sending %u (raw)", oc);
+            }
+            
+            // Set charge current to `0`
             if(!id(charging_allowed).state || !id(set_charging_allowed).state) {
               /* if charging is not allowed, set current to 0*/
-              canMessage[4] = 0x00;
-              canMessage[5] = 0x00;
+              canMessage[2] = 0x00;
+              canMessage[3] = 0x00;
             }
+
+            // Lower discharge limit if slider value is lower than `dischargeCurrent`
             if(id(set_discharge_current_limit).state <= dischargeCurrent) {
                 dischargeCurrent = (uint16_t)(id(set_discharge_current_limit).state) * 10;
                 canMessage[4] = (uint8_t)(dischargeCurrent & 0xFF);
@@ -447,16 +453,7 @@ canbus:
             }
 
             // Rebuild full 8-byte payload: [b0,b1, x[2]…x[7]]
-            std::vector<uint8_t> data = {
-              b0,
-              b1,
-              x[2],
-              x[3],
-              x[4],
-              x[5],
-              x[6],
-              x[7]
-            };
+            std::vector<uint8_t> data = {b0, b1, x[2], x[3], x[4], x[5], x[6], x[7]};
 
             // Send to inverter
             id(inverter)->send_data(can_id, false, data);
@@ -589,7 +586,7 @@ sensor:
     name: "jk soc"
     id: "jk_bms_soc"
     entity_id: sensor.jk_bms_state_of_charge
-    
+
   - platform: template
     name: "Battery voltage"
     id: "battery_voltage"
