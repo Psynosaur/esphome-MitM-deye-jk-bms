@@ -1,26 +1,5 @@
 # Man In The (middle) Deye
-
-## POC for balancing
-# new global variables:
-# bool balancing1 = false;
-# bool balancing = false;
-
-
-# 0x400:
-# if (x[3] != 0x00 || x[4] != 0x00) id(balancing1) = true else id(balancing1) = false;
-# 0x401:
-# if (x[3] != 0x00 || x[4] != 0x00 || id(balancing1)) id(balancing) = true else id(balancing) = false;
-
-# 0x351
-# uint8_t target_charge_current_limit = id(battery_charge_current_limit);
-# if id(battery_max_cell_voltage_deye).state < 3.35 && id(battery_max_cell_voltage_deye).state <= 3.40 id(target_charge_current_limit).publish_state(battery_charge_current_limit / 2);
-# if id(battery_max_cell_voltage_deye).state > 3.40 and id(balancing) == true target_charge_current_limit = 20;
-# if id(battery_max_cell_voltage_deye).state > 3.43 and id(balancing) == true target_charge_current_limit = 10;
-# if id(battery_max_cell_voltage_deye).state > 3.45 and id(balancing) == true target_charge_current_limit = 5;
-# if id(battery_max_cell_voltage_deye).state > 3.50 and id(balancing) == true target_charge_current_limit = 3;
-# if id(battery_max_cell_voltage_deye).state > 3.55 and id(balancing) == true target_charge_current_limit = 2;
-# write to can: target_charge_current_limit * 10
-
+# Read Deye Protocol from BMS and send to inverter with some modifications
 
 substitutions:
   name: mitm-deye
@@ -30,8 +9,8 @@ substitutions:
   offset_voltage: "0.4"
 
 #BMS specific:
-  charge_current: "120"
-  discharge_current: "120"
+  charge_current: "200"
+  discharge_current: "200"
 
 
 esphome:
@@ -125,6 +104,14 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
+  - id: last_invSoc
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  - id: last_jk_soc
+    type: int
+    restore_value: yes
+    initial_value: '0'
 
 time:
 # charge battery to 100% each sunday to calibrate cells and BMS
@@ -194,8 +181,8 @@ canbus:
 #      then:
 #        - lambda: |-
 #            ESP_LOGI("BMS:", "0x%x%02x: %02x %02x %02x %02x %02x %02x %02x %02x", (uint8_t)(can_id >> 8), (uint8_t)(can_id & 0xFF), x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]);
-
-    - can_id: 0x351 # Battery charging voltage and current limits
+    # Battery charging voltage and current limits
+    - can_id: 0x351 
       then:
         - lambda: |-
             float u_max = ((x[1] << 8) | x[0]) / 10.0;
@@ -212,28 +199,24 @@ canbus:
             id(noBmsUpdateCounter) = 0;  //bms is connected
             id(bms_connected).publish_state(true);
 
-            uint8_t canMessage[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+            uint8_t canMessage[] = {0x00, 0x00, x[2], x[3], x[4], x[5], x[6], x[7]};
+            
             uint16_t chargeVoltage = (uint16_t)((id(charge_voltage_override).state - id(charge_voltage_offset).state) * 10);
-            canMessage[0] = (uint8_t)(chargeVoltage & 0xFF);
-            canMessage[1] = (uint8_t)(chargeVoltage >> 8);
-            //canMessage[6] = 0x1A; //Discharge voltage 41.6V => 2.6V per cell
-            //canMessage[7] = 0x01; //Discharge voltage 41.6V
-            canMessage[6] = x[6];
-            canMessage[7] = x[7]; 
+            canMessage[0] = chargeVoltage & 0xFF;
+            canMessage[1] = chargeVoltage >> 8;
 
-            if((id(charge_to_90_only).state == true && id(battery_soc).state >= 90 && !id(force100soc)) || !id(charging_allowed).state || !id(set_charging_allowed).state){
-              /* if charging is not allowed, set current to 0, Deye don't like 0 and start discharging, so set to 1 amp (0x0A / 10 = 1A)  */
-              // canMessage[2] = 0x0A;
-              canMessage[2] = 0x00;
-              canMessage[3] = 0x00;
+            if(id(set_charge_current_limit).state <= chargeCurrent) { 
+              chargeCurrent = (uint16_t)(id(set_charge_current_limit).state) * 10; 
+              canMessage[2] = (uint8_t)(chargeCurrent & 0xFF);
+              canMessage[3] = (uint8_t)(chargeCurrent >> 8);
             }else{
-              if(id(set_charge_current_limit).state <= chargeCurrent) { 
-                chargeCurrent = (uint16_t)(id(set_charge_current_limit).state) * 10; 
-                canMessage[2] = (uint8_t)(chargeCurrent & 0xFF);
-                canMessage[3] = (uint8_t)(chargeCurrent >> 8);
-              }else{
-                canMessage[2] = (uint8_t)x[2];
-                canMessage[3] = (uint8_t)x[3];
+              // Determine charge-current bytes
+              if (id(use_charge_current_override).state) {
+                // scale slider (A → raw) and split into LSB/MSB
+                uint16_t oc = (uint16_t)(id(set_charge_current_limit).state * 10);
+                canMessage[2] = oc & 0xFF;
+                canMessage[3] = oc >> 8;
+                ESP_LOGI("0x371", "Override active - sending %u (raw)", oc);
               }
             }
 
@@ -247,17 +230,12 @@ canbus:
                 canMessage[4] = (uint8_t)(dischargeCurrent & 0xFF);
                 canMessage[5] = (uint8_t)(dischargeCurrent >> 8);
             }
-            else{
-                canMessage[4] = x[4];
-                canMessage[5] = x[5];
-            }
-            
-            //ESP_LOGI("canid 0x351:", "%02x %02x %02x %02x %02x %02x %02x %02x", canMessage[0], canMessage[1], canMessage[2], canMessage[3], canMessage[4], canMessage[5], canMessage[6], canMessage[7]);
+
             std::vector< uint8_t > data{canMessage[0], canMessage[1], canMessage[2], canMessage[3], canMessage[4], canMessage[5], canMessage[6], canMessage[7]};
-            //std::vector< uint8_t > data{canMessage[0], canMessage[1], canMessage[2], canMessage[3], x[4], x[5], canMessage[6], canMessage[7]};
+            
             id(inverter)->send_data(can_id, false, data);
             //ESP_LOGI("canid 0x351:", "U_max: %.1f V, I_charge %d A, I_discharge: %d A", u_max, chargeCurrent / 10, dischargeCurrent / 10);
-
+    
     - can_id: 0x355
       then:
         - lambda: |-
@@ -299,9 +277,36 @@ canbus:
                 id(invSoc) = (socByte1 << 8) | socByte0;
               }
             }
-            //ESP_LOGI("canid 0x359:", "invSoc: %d %%", id(invSoc));
-            //ESP_LOGI("canid 0x359:", "%02x %02x %02x %02x %02x %02x %02x %02x", socByte0, socByte1, (uint8_t)id(can355)[2], (uint8_t)id(can355)[3], (uint8_t)id(can355)[4], (uint8_t)id(can355)[5], (uint8_t)id(can355)[6], (uint8_t)id(can355)[7]); 
-            std::vector< uint8_t > data{socByte0, socByte1, x[2], x[3], x[4], x[5], x[6], x[7]};
+            // Log raw SoC values from inverter (Deye) and jk_bms.
+            ESP_LOGI("SoC values", "Deye: %d, jk_bms_soc: %.0f", id(invSoc), id(jk_bms_soc).state);
+
+            // Read new sensor values.
+            int new_invSoc = id(invSoc);
+            int new_jk_soc = id(jk_bms_soc).has_state() ? (int)id(jk_bms_soc).state : 0;
+
+            // Update globals only if:
+            //   - The global is 0 (initialization) OR
+            //   - The new reading is non-zero (to avoid error updates) AND the difference is within 2%.
+            if ( id(last_invSoc) == 0 || ( new_invSoc != 0 && abs(new_invSoc - id(last_invSoc)) <= 2 ) ) {
+              id(last_invSoc) = new_invSoc;
+            }
+            if ( id(last_jk_soc) == 0 || ( new_jk_soc != 0 && abs(new_jk_soc - id(last_jk_soc)) <= 2 ) ) {
+              id(last_jk_soc) = new_jk_soc;
+            } 
+            // Log the filtered (stored) values.
+            ESP_LOGI("Filtered SoC", "Stored Deye: %d, Stored jk_bms_soc: %d", id(last_invSoc), id(last_jk_soc));
+
+            // Compute the average from the stored values.
+            int combined = ( id(last_invSoc) + id(last_jk_soc) ) / 2;
+
+            // Update socByte0 and socByte1 based on the average.
+            socByte0 = combined & 0xFF;
+            socByte1 = (combined >> 8) & 0xFF;
+
+            ESP_LOGI("Combined SoC", "Average SoC: %d", combined);
+
+            // Prepare and send the final CAN data vector.
+            std::vector<uint8_t> data{socByte0, socByte1, x[2], x[3], x[4], x[5], x[6], x[7]};
             id(inverter)->send_data(can_id, false, data);
 #            ESP_LOGI("canid 0x355:", "SoC %d %, SoH %d %",soc, soh );
 
@@ -430,11 +435,31 @@ canbus:
     - can_id: 0x371
       then:
         - lambda: |-
-            id(inverter)->send_data(can_id, false, x);
-            //int i_charge = ((x[1] << 8) | x[0]) / 10;
-            //id(battery_charge_current_limit_deye).publish_state(i_charge);
-            //int i_discharge = ((x[3] << 8) | x[2]) / 10;
-            //id(battery_discharge_current_limit_deye).publish_state(i_discharge);
+            // Determine charge-current bytes
+            uint8_t b0 = x[0];
+            uint8_t b1 = x[1];
+            if (id(use_charge_current_override).state) {
+              // scale slider (A → raw) and split into LSB/MSB
+              uint16_t oc = (uint16_t)(id(set_charge_current_limit).state * 10);
+              b0 = oc & 0xFF;
+              b1 = oc >> 8;
+              ESP_LOGI("0x371", "Override active - sending %u (raw)", oc);
+            }
+
+            // Rebuild full 8-byte payload: [b0,b1, x[2]…x[7]]
+            std::vector<uint8_t> data = {
+              b0,
+              b1,
+              x[2],
+              x[3],
+              x[4],
+              x[5],
+              x[6],
+              x[7]
+            };
+
+            // Send to inverter
+            id(inverter)->send_data(can_id, false, data);
     - can_id: 0x110 
       then:
         - lambda: |-
@@ -560,6 +585,11 @@ interval:
         }
 
 sensor:
+  - platform: homeassistant
+    name: "jk soc"
+    id: "jk_bms_soc"
+    entity_id: sensor.jk_bms_state_of_charge
+    
   - platform: template
     name: "Battery voltage"
     id: "battery_voltage"
@@ -711,6 +741,12 @@ number:
     restore_value: True
 
 switch:
+  - platform: template
+    name: "Use Charge Current Override"
+    id: use_charge_current_override
+    optimistic: True
+    restore_mode: ALWAYS_OFF
+
     # Add these new switches
   - platform: template
     name: "Block BMS Force Charge 1"
