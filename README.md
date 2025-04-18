@@ -47,7 +47,7 @@ Tested with Deye SE-G5.1 Pro BMS and Deye SUN8K single phase inverter
 ![mitm](https://i.imgur.com/EDk8vfV.png)
 
 ## Plans:
-  - Build JK battery...
-  - Add JK inverter BMS into the mix: 
-    - 2xDeye - 200Ah 
-    - 1xJK200A - 280Ah (CAN/RS485)
+  - ~Build JK battery...~
+  - ~Add JK inverter BMS into the mix:~
+    - ~2xDeye - 200Ah~
+    - ~1xJK200A - 280Ah (CAN/RS485/*BLE*)~
