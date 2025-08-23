@@ -112,7 +112,14 @@ globals:
     type: int
     restore_value: yes
     initial_value: '0'
-
+  - id: last_pack1_soc
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  - id: last_pack2_soc
+    type: int
+    restore_value: yes
+    initial_value: '0'
 time:
 # charge battery to 100% each sunday to calibrate cells and BMS
   - platform: sntp
@@ -249,73 +256,64 @@ canbus:
             id(battery_soc).publish_state(soc);
             int soh = ((x[3] << 8) | x[2]);
             id(battery_soh).publish_state(soh);
-            if(id(invSoc) >= 100) id(force100soc) = false;
-            //for(uint8_t i = 0; i < 8; i++){ id(can355)[i] = x[i]; }
-            uint8_t socByte0 = 0;
-            uint8_t socByte1 = 0;
-            // if SoC 100% (RCV/RFV) control is enabled, send max. 99% SoC to inverter until float voltage is reached.
-            // Logic: if soc_100_rcv_rfv_control == false or SoC under 99%: send data 1:1 from bms to inverter
-            // if soc_100_rcv_rfv_control == true and BMS SoC 99% or 100% wait until float-stage and then send 100%
-            if(id(soc_100_rcv_rfv_control).state && id(battery_soc).state >= 99){
-              if (id(battery_voltage).state < id(saveRcv)){
-                  //float-stage, send 100% SoC to inverter
-                  socByte0 = 0x64;
-                  socByte1 = 0x00;
-                  id(invSoc) = 100;
-                  //ESP_LOGI("To Inv 0x355", "float stage");
-              }else{
-                  //still charge voltage -> not yet fully charged, send 99% SoC to inverter
-                  socByte0 = 0x63;
-                  socByte1 = 0x00;
-                  id(invSoc) = 99;
-                  //ESP_LOGI("To Inv 0x355", "charging stage");
-              }
-            }else{
-              //Dirty hack to discharge battery to 0%: send 2% instead of 1%, because Deye stops at 1%
-              if((uint8_t)x[0] == 1){
-                socByte0 = 0x02;
-                socByte1 = 0x00;
-                id(invSoc) = (socByte1 << 8) | socByte0;
-              }else{
-                //no modifications, send BMS data directly to inverter
-                socByte0 = (uint8_t)x[0];
-                socByte1 = (uint8_t)x[1];
-                id(invSoc) = (socByte1 << 8) | socByte0;
-              }
-            }
-            // Log raw SoC values from inverter (Deye) and jk_bms.
-            ESP_LOGI("SoC values", "Deye: %d, jk_bms_soc: %.0f", id(invSoc), id(jk_bms_soc).state);
-
-            // Read new sensor values.
-            int new_invSoc = id(invSoc);
+            
+            // Read all three SOC values
             int new_jk_soc = id(jk_bms_soc).has_state() ? (int)id(jk_bms_soc).state : 0;
-
-            // Update globals only if:
-            //   - The global is 0 (initialization) OR
-            //   - The new reading is non-zero (to avoid error updates) AND the difference is within 2%.
-            if ( id(last_invSoc) == 0 || ( new_invSoc != 0 && abs(new_invSoc - id(last_invSoc)) <= 2 ) ) {
-              id(last_invSoc) = new_invSoc;
-            }
-            if ( id(last_jk_soc) == 0 || ( new_jk_soc != 0 && abs(new_jk_soc - id(last_jk_soc)) <= 2 ) ) {
+            int new_pack1_soc = id(pack_1_soc).has_state() ? (int)id(pack_1_soc).state : 0;
+            int new_pack2_soc = id(pack_2_soc).has_state() ? (int)id(pack_2_soc).state : 0;
+            
+            // Apply filtering to each SOC value (allow 0% updates)
+            if (id(last_jk_soc) == 0 || new_jk_soc == 0 || abs(new_jk_soc - id(last_jk_soc)) <= 2) {
               id(last_jk_soc) = new_jk_soc;
-            } 
-            // Log the filtered (stored) values.
-            ESP_LOGI("Filtered SoC", "Stored Deye: %d, Stored jk_bms_soc: %d", id(last_invSoc), id(last_jk_soc));
-
-            // Compute the average from the stored values.
-            int combined = ( id(last_invSoc) + id(last_jk_soc) ) / 2;
-
-            // Update socByte0 and socByte1 based on the average.
-            socByte0 = combined & 0xFF;
-            socByte1 = (combined >> 8) & 0xFF;
-
-            ESP_LOGI("Combined SoC", "Average SoC: %d", combined);
-
-            // Prepare and send the final CAN data vector.
+            }
+            if (id(last_pack1_soc) == 0 || new_pack1_soc == 0 || abs(new_pack1_soc - id(last_pack1_soc)) <= 2) {
+              id(last_pack1_soc) = new_pack1_soc;
+            }
+            if (id(last_pack2_soc) == 0 || new_pack2_soc == 0 || abs(new_pack2_soc - id(last_pack2_soc)) <= 2) {
+              id(last_pack2_soc) = new_pack2_soc;
+            }
+            
+            // Calculate combined average
+            int combined = (id(last_jk_soc) + id(last_pack1_soc) + id(last_pack2_soc)) / 3;
+            
+            // Apply 1% hack to the combined value
+            if (combined == 1) {
+              combined = 2;
+            }
+            
+            // Update invSoc with the combined value
+            id(invSoc) = combined;
+            
+            // Prepare SOC bytes for CAN message
+            uint8_t socByte0 = combined & 0xFF;
+            uint8_t socByte1 = (combined >> 8) & 0xFF;
+            
+            // Log values for debugging
+            ESP_LOGI("SOC Values", "JK: %d%%, Pack1: %d%%, Pack2: %d%%, Combined: %d%%", 
+                    id(last_jk_soc), id(last_pack1_soc), id(last_pack2_soc), combined);
+            
+            // Send the CAN message
             std::vector<uint8_t> data{socByte0, socByte1, x[2], x[3], x[4], x[5], x[6], x[7]};
             id(inverter)->send_data(can_id, false, data);
 #            ESP_LOGI("canid 0x355:", "SoC %d %, SoH %d %",soc, soh );
+# // Update globals only if:
+# //   - The global is 0 (initialization) OR
+# //   - The new reading is non-zero (to avoid error updates) AND the difference is within 2%.
+# if ( id(last_invSoc) == 0 || ( new_invSoc != 0 && abs(new_invSoc - id(last_invSoc)) <= 2 ) ) {
+#   id(last_invSoc) = new_invSoc;
+# }
+# if ( id(last_jk_soc) == 0 || ( new_jk_soc != 0 && abs(new_jk_soc - id(last_jk_soc)) <= 2 ) ) {
+#   id(last_jk_soc) = new_jk_soc;
+# } 
+# // Log the filtered (stored) values.
+# ESP_LOGI("Filtered SoC", "Stored Deye: %d, Stored jk_bms_soc: %d", id(last_invSoc), id(last_jk_soc));
 
+# // Compute the average from the stored values.
+# int combined = ( id(last_invSoc) + id(last_jk_soc) ) / 2;
+
+# // Update socByte0 and socByte1 based on the average.
+# socByte0 = combined & 0xFF;
+# socByte1 = (combined >> 8) & 0xFF;
     - can_id: 0x356
       then:
         - lambda: |-
@@ -586,6 +584,16 @@ sensor:
     name: "jk soc"
     id: "jk_bms_soc"
     entity_id: sensor.jk_bms_state_of_charge
+
+  - platform: homeassistant
+    name: "pack_1_soc"
+    id: "pack_1_soc"
+    entity_id: sensor.deye_pcs_can_bus_pack_1_soc
+
+  - platform: homeassistant
+    name: "pack_2_soc"
+    id: "pack_2_soc"
+    entity_id: sensor.deye_pcs_can_bus_pack_2_soc
 
   - platform: template
     name: "Battery voltage"
