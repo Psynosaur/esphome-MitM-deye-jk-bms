@@ -295,25 +295,7 @@ canbus:
             // Send the CAN message
             std::vector<uint8_t> data{socByte0, socByte1, x[2], x[3], x[4], x[5], x[6], x[7]};
             id(inverter)->send_data(can_id, false, data);
-#            ESP_LOGI("canid 0x355:", "SoC %d %, SoH %d %",soc, soh );
-# // Update globals only if:
-# //   - The global is 0 (initialization) OR
-# //   - The new reading is non-zero (to avoid error updates) AND the difference is within 2%.
-# if ( id(last_invSoc) == 0 || ( new_invSoc != 0 && abs(new_invSoc - id(last_invSoc)) <= 2 ) ) {
-#   id(last_invSoc) = new_invSoc;
-# }
-# if ( id(last_jk_soc) == 0 || ( new_jk_soc != 0 && abs(new_jk_soc - id(last_jk_soc)) <= 2 ) ) {
-#   id(last_jk_soc) = new_jk_soc;
-# } 
-# // Log the filtered (stored) values.
-# ESP_LOGI("Filtered SoC", "Stored Deye: %d, Stored jk_bms_soc: %d", id(last_invSoc), id(last_jk_soc));
 
-# // Compute the average from the stored values.
-# int combined = ( id(last_invSoc) + id(last_jk_soc) ) / 2;
-
-# // Update socByte0 and socByte1 based on the average.
-# socByte0 = combined & 0xFF;
-# socByte1 = (combined >> 8) & 0xFF;
     - can_id: 0x356
       then:
         - lambda: |-
