@@ -248,7 +248,7 @@ canbus:
             
             id(inverter)->send_data(can_id, false, data);
             //ESP_LOGI("canid 0x351:", "U_max: %.1f V, I_charge %d A, I_discharge: %d A", u_max, chargeCurrent / 10, dischargeCurrent / 10);
-    
+
     - can_id: 0x355
       then:
         - lambda: |-
@@ -257,10 +257,24 @@ canbus:
             int soh = ((x[3] << 8) | x[2]);
             id(battery_soh).publish_state(soh);
             
-            // Read all three SOC values
+            // Read all three SOC values with validation
             int new_jk_soc = id(jk_bms_soc).has_state() ? (int)id(jk_bms_soc).state : 0;
             int new_pack1_soc = id(pack_1_soc).has_state() ? (int)id(pack_1_soc).state : 0;
             int new_pack2_soc = id(pack_2_soc).has_state() ? (int)id(pack_2_soc).state : 0;
+            
+            // Validate SOC values are within reasonable range (0-100)
+            if (new_jk_soc < 0 || new_jk_soc > 100) {
+              ESP_LOGW("SOC", "JK SOC out of range: %d, using last value", new_jk_soc);
+              new_jk_soc = id(last_jk_soc);
+            }
+            if (new_pack1_soc < 0 || new_pack1_soc > 100) {
+              ESP_LOGW("SOC", "Pack1 SOC out of range: %d, using last value", new_pack1_soc);
+              new_pack1_soc = id(last_pack1_soc);
+            }
+            if (new_pack2_soc < 0 || new_pack2_soc > 100) {
+              ESP_LOGW("SOC", "Pack2 SOC out of range: %d, using last value", new_pack2_soc);
+              new_pack2_soc = id(last_pack2_soc);
+            }
             
             // Apply filtering to each SOC value (allow 0% updates)
             if (id(last_jk_soc) == 0 || new_jk_soc == 0 || abs(new_jk_soc - id(last_jk_soc)) <= 2) {
@@ -273,8 +287,24 @@ canbus:
               id(last_pack2_soc) = new_pack2_soc;
             }
             
-            // Calculate combined average
-            int combined = (id(last_jk_soc) + id(last_pack1_soc) + id(last_pack2_soc)) / 3;
+            // Calculate combined average only with valid values
+            int valid_batteries = 0;
+            int total_soc = 0;
+            
+            if (id(last_jk_soc) >= 0 && id(last_jk_soc) <= 100) {
+              total_soc += id(last_jk_soc);
+              valid_batteries++;
+            }
+            if (id(last_pack1_soc) >= 0 && id(last_pack1_soc) <= 100) {
+              total_soc += id(last_pack1_soc);
+              valid_batteries++;
+            }
+            if (id(last_pack2_soc) >= 0 && id(last_pack2_soc) <= 100) {
+              total_soc += id(last_pack2_soc);
+              valid_batteries++;
+            }
+            
+            int combined = valid_batteries > 0 ? total_soc / valid_batteries : 0;
             
             // Apply 1% hack to the combined value
             if (combined == 1) {
