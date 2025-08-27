@@ -120,6 +120,16 @@ globals:
     type: int
     restore_value: yes
     initial_value: '0'
+  - id: jk_unavailable_count
+    type: int
+    initial_value: '0'
+  - id: pack1_unavailable_count
+    type: int
+    initial_value: '0'
+  - id: pack2_unavailable_count
+    type: int
+    initial_value: '0'
+
 time:
 # charge battery to 100% each sunday to calibrate cells and BMS
   - platform: sntp
@@ -257,54 +267,56 @@ canbus:
             int soh = ((x[3] << 8) | x[2]);
             id(battery_soh).publish_state(soh);
             
-            // Read all three SOC values with validation
-            int new_jk_soc = id(jk_bms_soc).has_state() ? (int)id(jk_bms_soc).state : 0;
-            int new_pack1_soc = id(pack_1_soc).has_state() ? (int)id(pack_1_soc).state : 0;
-            int new_pack2_soc = id(pack_2_soc).has_state() ? (int)id(pack_2_soc).state : 0;
+            // Track availability of each SOC source
+            bool jk_available = id(jk_bms_soc).has_state();
+            bool pack1_available = id(pack_1_soc).has_state();
+            bool pack2_available = id(pack_2_soc).has_state();
             
-            // Validate SOC values are within reasonable range (0-100)
-            if (new_jk_soc < 0 || new_jk_soc > 100) {
-              ESP_LOGW("SOC", "JK SOC out of range: %d, using last value", new_jk_soc);
-              new_jk_soc = id(last_jk_soc);
-            }
-            if (new_pack1_soc < 0 || new_pack1_soc > 100) {
-              ESP_LOGW("SOC", "Pack1 SOC out of range: %d, using last value", new_pack1_soc);
-              new_pack1_soc = id(last_pack1_soc);
-            }
-            if (new_pack2_soc < 0 || new_pack2_soc > 100) {
-              ESP_LOGW("SOC", "Pack2 SOC out of range: %d, using last value", new_pack2_soc);
-              new_pack2_soc = id(last_pack2_soc);
-            }
+            // Update availability counters
+            id(jk_unavailable_count) = jk_available ? 0 : min(100, id(jk_unavailable_count) + 1);
+            id(pack1_unavailable_count) = pack1_available ? 0 : min(100, id(pack1_unavailable_count) + 1);
+            id(pack2_unavailable_count) = pack2_available ? 0 : min(100, id(pack2_unavailable_count) + 1);
+            
+            // Read available SOC values with fallback to last known values
+            int new_jk_soc = jk_available ? (int)id(jk_bms_soc).state : id(last_jk_soc);
+            int new_pack1_soc = pack1_available ? (int)id(pack_1_soc).state : id(last_pack1_soc);
+            int new_pack2_soc = pack2_available ? (int)id(pack_2_soc).state : id(last_pack2_soc);
             
             // Apply filtering to each SOC value (allow 0% updates)
-            if (id(last_jk_soc) == 0 || new_jk_soc == 0 || abs(new_jk_soc - id(last_jk_soc)) <= 2) {
+            if (jk_available && (id(last_jk_soc) == 0 || new_jk_soc == 0 || abs(new_jk_soc - id(last_jk_soc)) <= 2)) {
               id(last_jk_soc) = new_jk_soc;
             }
-            if (id(last_pack1_soc) == 0 || new_pack1_soc == 0 || abs(new_pack1_soc - id(last_pack1_soc)) <= 2) {
+            if (pack1_available && (id(last_pack1_soc) == 0 || new_pack1_soc == 0 || abs(new_pack1_soc - id(last_pack1_soc)) <= 2)) {
               id(last_pack1_soc) = new_pack1_soc;
             }
-            if (id(last_pack2_soc) == 0 || new_pack2_soc == 0 || abs(new_pack2_soc - id(last_pack2_soc)) <= 2) {
+            if (pack2_available && (id(last_pack2_soc) == 0 || new_pack2_soc == 0 || abs(new_pack2_soc - id(last_pack2_soc)) <= 2)) {
               id(last_pack2_soc) = new_pack2_soc;
             }
             
-            // Calculate combined average only with valid values
-            int valid_batteries = 0;
-            int total_soc = 0;
+            // Determine which values to use in calculation based on availability
+            int jk_to_use = (id(jk_unavailable_count) < 100) ? id(last_jk_soc) : -1;
+            int pack1_to_use = (id(pack1_unavailable_count) < 100) ? id(last_pack1_soc) : -1;
+            int pack2_to_use = (id(pack2_unavailable_count) < 100) ? id(last_pack2_soc) : -1;
             
-            if (id(last_jk_soc) >= 0 && id(last_jk_soc) <= 100) {
-              total_soc += id(last_jk_soc);
-              valid_batteries++;
+            // Calculate combined average from available sources
+            int count = 0;
+            int total = 0;
+            
+            if (jk_to_use != -1) {
+              total += jk_to_use;
+              count++;
             }
-            if (id(last_pack1_soc) >= 0 && id(last_pack1_soc) <= 100) {
-              total_soc += id(last_pack1_soc);
-              valid_batteries++;
+            if (pack1_to_use != -1) {
+              total += pack1_to_use;
+              count++;
             }
-            if (id(last_pack2_soc) >= 0 && id(last_pack2_soc) <= 100) {
-              total_soc += id(last_pack2_soc);
-              valid_batteries++;
+            if (pack2_to_use != -1) {
+              total += pack2_to_use;
+              count++;
             }
             
-            int combined = valid_batteries > 0 ? total_soc / valid_batteries : 0;
+            // If no sources available, use a safe default (50%)
+            int combined = (count > 0) ? total / count : 50;
             
             // Apply 1% hack to the combined value
             if (combined == 1) {
@@ -319,8 +331,15 @@ canbus:
             uint8_t socByte1 = (combined >> 8) & 0xFF;
             
             // Log values for debugging
-            ESP_LOGI("SOC Values", "JK: %d%%, Pack1: %d%%, Pack2: %d%%, Combined: %d%%", 
-                    id(last_jk_soc), id(last_pack1_soc), id(last_pack2_soc), combined);
+            ESP_LOGI("SOC Monitoring", 
+                    "JK: %d%% (%s), Pack1: %d%% (%s), Pack2: %d%% (%s), Combined: %d%%", 
+                    id(last_jk_soc), 
+                    (id(jk_unavailable_count) < 100) ? "Available" : "Unavailable",
+                    id(last_pack1_soc),
+                    (id(pack1_unavailable_count) < 100) ? "Available" : "Unavailable",
+                    id(last_pack2_soc),
+                    (id(pack2_unavailable_count) < 100) ? "Available" : "Unavailable",
+                    combined);
             
             // Send the CAN message
             std::vector<uint8_t> data{socByte0, socByte1, x[2], x[3], x[4], x[5], x[6], x[7]};
@@ -681,7 +700,7 @@ sensor:
     accuracy_decimals: 0   
 
 binary_sensor:
-# 0x35C byte 0
+    # 0x35C byte 0
   - platform: template
     name: "Charging allowed"
     id: "charging_allowed"
