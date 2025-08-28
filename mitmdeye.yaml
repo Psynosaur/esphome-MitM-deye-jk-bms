@@ -109,17 +109,17 @@ globals:
     restore_value: yes
     initial_value: '0'
   - id: last_jk_soc
-    type: int
-    restore_value: yes
-    initial_value: '0'
+    type: float
+    restore_value: no
+    initial_value: '0.0'
   - id: last_pack1_soc
-    type: int
-    restore_value: yes
-    initial_value: '0'
+    type: float
+    restore_value: no
+    initial_value: '0.0'
   - id: last_pack2_soc
-    type: int
-    restore_value: yes
-    initial_value: '0'
+    type: float
+    restore_value: no
+    initial_value: '0.0'
   - id: jk_unavailable_count
     type: int
     initial_value: '0'
@@ -277,46 +277,70 @@ canbus:
             id(pack1_unavailable_count) = pack1_available ? 0 : min(100, id(pack1_unavailable_count) + 1);
             id(pack2_unavailable_count) = pack2_available ? 0 : min(100, id(pack2_unavailable_count) + 1);
             
-            // Read available SOC values with fallback to last known values
-            int new_jk_soc = jk_available ? (int)id(jk_bms_soc).state : id(last_jk_soc);
-            int new_pack1_soc = pack1_available ? (int)id(pack_1_soc).state : id(last_pack1_soc);
-            int new_pack2_soc = pack2_available ? (int)id(pack_2_soc).state : id(last_pack2_soc);
-            
-            // Apply filtering to each SOC value (allow 0% updates)
-            if (jk_available && (id(last_jk_soc) == 0 || new_jk_soc == 0 || abs(new_jk_soc - id(last_jk_soc)) <= 2)) {
-              id(last_jk_soc) = new_jk_soc;
+            // Read available SOC values as floats with fallback to last known values
+            float new_jk_soc = jk_available ? id(jk_bms_soc).state : id(last_jk_soc);
+            float new_pack1_soc = pack1_available ? id(pack_1_soc).state : id(last_pack1_soc);
+            float new_pack2_soc = pack2_available ? id(pack_2_soc).state : id(last_pack2_soc);
+
+            // Log raw values for debugging
+            ESP_LOGI("SOC Raw Values",
+                    "JK: %.1f%% (%s), Pack1: %.1f%% (%s), Pack2: %.1f%% (%s)",
+                    new_jk_soc, jk_available ? "Available" : "Unavailable",
+                    new_pack1_soc, pack1_available ? "Available" : "Unavailable",
+                    new_pack2_soc, pack2_available ? "Available" : "Unavailable");
+
+            // Apply filtering to each SOC value
+            // Allow updates if: first reading (last == 0.0), new value is 0%, or within 2% tolerance
+            if (jk_available) {
+              bool should_update = (id(last_jk_soc) == 0.0 || new_jk_soc == 0.0 || abs(new_jk_soc - id(last_jk_soc)) <= 2.0);
+              ESP_LOGI("SOC Filter", "JK: last=%.1f, new=%.1f, diff=%.1f, update=%s",
+                      id(last_jk_soc), new_jk_soc, abs(new_jk_soc - id(last_jk_soc)), should_update ? "YES" : "NO");
+              if (should_update) {
+                id(last_jk_soc) = new_jk_soc;
+              }
             }
-            if (pack1_available && (id(last_pack1_soc) == 0 || new_pack1_soc == 0 || abs(new_pack1_soc - id(last_pack1_soc)) <= 2)) {
-              id(last_pack1_soc) = new_pack1_soc;
+            if (pack1_available) {
+              bool should_update = (id(last_pack1_soc) == 0.0 || new_pack1_soc == 0.0 || abs(new_pack1_soc - id(last_pack1_soc)) <= 2.0);
+              ESP_LOGI("SOC Filter", "Pack1: last=%.1f, new=%.1f, diff=%.1f, update=%s",
+                      id(last_pack1_soc), new_pack1_soc, abs(new_pack1_soc - id(last_pack1_soc)), should_update ? "YES" : "NO");
+              if (should_update) {
+                id(last_pack1_soc) = new_pack1_soc;
+              }
             }
-            if (pack2_available && (id(last_pack2_soc) == 0 || new_pack2_soc == 0 || abs(new_pack2_soc - id(last_pack2_soc)) <= 2)) {
-              id(last_pack2_soc) = new_pack2_soc;
+            if (pack2_available) {
+              bool should_update = (id(last_pack2_soc) == 0.0 || new_pack2_soc == 0.0 || abs(new_pack2_soc - id(last_pack2_soc)) <= 2.0);
+              ESP_LOGI("SOC Filter", "Pack2: last=%.1f, new=%.1f, diff=%.1f, update=%s",
+                      id(last_pack2_soc), new_pack2_soc, abs(new_pack2_soc - id(last_pack2_soc)), should_update ? "YES" : "NO");
+              if (should_update) {
+                id(last_pack2_soc) = new_pack2_soc;
+              }
             }
             
             // Determine which values to use in calculation based on availability
-            int jk_to_use = (id(jk_unavailable_count) < 100) ? id(last_jk_soc) : -1;
-            int pack1_to_use = (id(pack1_unavailable_count) < 100) ? id(last_pack1_soc) : -1;
-            int pack2_to_use = (id(pack2_unavailable_count) < 100) ? id(last_pack2_soc) : -1;
-            
+            float jk_to_use = (id(jk_unavailable_count) < 100) ? id(last_jk_soc) : -1.0;
+            float pack1_to_use = (id(pack1_unavailable_count) < 100) ? id(last_pack1_soc) : -1.0;
+            float pack2_to_use = (id(pack2_unavailable_count) < 100) ? id(last_pack2_soc) : -1.0;
+
             // Calculate combined average from available sources
             int count = 0;
-            int total = 0;
-            
-            if (jk_to_use != -1) {
+            float total = 0.0;
+
+            if (jk_to_use != -1.0) {
               total += jk_to_use;
               count++;
             }
-            if (pack1_to_use != -1) {
+            if (pack1_to_use != -1.0) {
               total += pack1_to_use;
               count++;
             }
-            if (pack2_to_use != -1) {
+            if (pack2_to_use != -1.0) {
               total += pack2_to_use;
               count++;
             }
-            
+
             // If no sources available, use a safe default (50%)
-            int combined = (count > 0) ? total / count : 50;
+            // Use proper rounding instead of truncation
+            int combined = (count > 0) ? (int)round(total / count) : 50;
             
             // Apply 1% hack to the combined value
             if (combined == 1) {
@@ -331,9 +355,9 @@ canbus:
             uint8_t socByte1 = (combined >> 8) & 0xFF;
             
             // Log values for debugging
-            ESP_LOGI("SOC Monitoring", 
-                    "JK: %d%% (%s), Pack1: %d%% (%s), Pack2: %d%% (%s), Combined: %d%%", 
-                    id(last_jk_soc), 
+            ESP_LOGI("SOC Monitoring",
+                    "JK: %.1f%% (%s), Pack1: %.1f%% (%s), Pack2: %.1f%% (%s), Combined: %d%%",
+                    id(last_jk_soc),
                     (id(jk_unavailable_count) < 100) ? "Available" : "Unavailable",
                     id(last_pack1_soc),
                     (id(pack1_unavailable_count) < 100) ? "Available" : "Unavailable",
