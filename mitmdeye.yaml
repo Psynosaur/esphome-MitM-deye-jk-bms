@@ -146,6 +146,15 @@ time:
         lambda: |-
           id(force100soc) = true;
 
+# Scripts for notifications
+script:
+  - id: can_failure_notification
+    then:
+      - homeassistant.service:
+          service: notify.HomeA55Bot # rename to whatever your bot username is
+          data:
+            message: "MitM ESP restarted due to CAN failure."
+
 # for MCP2515
 # spi:
 #  miso_pin: GPIO27
@@ -666,6 +675,13 @@ interval:
         // If inverter has been unresponsive for 30+ cycles (30+ seconds), restart ESP
         if (id(can_send_failure_count) >= 30) {
           ESP_LOGE("main", "CAN communication failed for 30+ seconds, restarting ESP to recover...");
+
+          // Send Telegram notification before restart
+          id(can_failure_notification).execute();
+
+          // Small delay to ensure notification is sent before restart
+          delay(2000);
+
           // Trigger restart using the restart switch
           auto restart_switch = id(restart_mitm_deye);
           restart_switch->turn_on();
