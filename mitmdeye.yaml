@@ -129,6 +129,10 @@ globals:
   - id: pack2_unavailable_count
     type: int
     initial_value: '0'
+  - id: can_send_failure_count
+    type: int
+    restore_value: no
+    initial_value: '0'
 
 time:
 # charge battery to 100% each sunday to calibrate cells and BMS
@@ -271,27 +275,47 @@ canbus:
             bool jk_available = id(jk_bms_soc).has_state();
             bool pack1_available = id(pack_1_soc).has_state();
             bool pack2_available = id(pack_2_soc).has_state();
-            
-            // Update availability counters
-            id(jk_unavailable_count) = jk_available ? 0 : min(100, id(jk_unavailable_count) + 1);
-            id(pack1_unavailable_count) = pack1_available ? 0 : min(100, id(pack1_unavailable_count) + 1);
-            id(pack2_unavailable_count) = pack2_available ? 0 : min(100, id(pack2_unavailable_count) + 1);
-            
+
             // Read available SOC values as floats with fallback to last known values
             float new_jk_soc = jk_available ? id(jk_bms_soc).state : id(last_jk_soc);
             float new_pack1_soc = pack1_available ? id(pack_1_soc).state : id(last_pack1_soc);
             float new_pack2_soc = pack2_available ? id(pack_2_soc).state : id(last_pack2_soc);
 
+            // Check for NaN values and mark as unavailable if found
+            bool jk_valid = jk_available && !isnan(new_jk_soc);
+            bool pack1_valid = pack1_available && !isnan(new_pack1_soc);
+            bool pack2_valid = pack2_available && !isnan(new_pack2_soc);
+
+            // Update availability counters (consider NaN as unavailable)
+            id(jk_unavailable_count) = jk_valid ? 0 : min(100, id(jk_unavailable_count) + 1);
+            id(pack1_unavailable_count) = pack1_valid ? 0 : min(100, id(pack1_unavailable_count) + 1);
+            id(pack2_unavailable_count) = pack2_valid ? 0 : min(100, id(pack2_unavailable_count) + 1);
+
+            // If NaN detected, use last known good value
+            if (jk_available && isnan(new_jk_soc)) {
+              new_jk_soc = id(last_jk_soc);
+              ESP_LOGW("SOC NaN", "JK BMS returned NaN, using last value: %.1f%%", new_jk_soc);
+            }
+            if (pack1_available && isnan(new_pack1_soc)) {
+              new_pack1_soc = id(last_pack1_soc);
+              ESP_LOGW("SOC NaN", "Pack1 returned NaN, using last value: %.1f%%", new_pack1_soc);
+            }
+            if (pack2_available && isnan(new_pack2_soc)) {
+              new_pack2_soc = id(last_pack2_soc);
+              ESP_LOGW("SOC NaN", "Pack2 returned NaN, using last value: %.1f%%", new_pack2_soc);
+            }
+
             // Log raw values for debugging
             ESP_LOGI("SOC Raw Values",
                     "JK: %.1f%% (%s), Pack1: %.1f%% (%s), Pack2: %.1f%% (%s)",
-                    new_jk_soc, jk_available ? "Available" : "Unavailable",
-                    new_pack1_soc, pack1_available ? "Available" : "Unavailable",
-                    new_pack2_soc, pack2_available ? "Available" : "Unavailable");
+                    new_jk_soc, jk_valid ? "Valid" : "Invalid/NaN",
+                    new_pack1_soc, pack1_valid ? "Valid" : "Invalid/NaN",
+                    new_pack2_soc, pack2_valid ? "Valid" : "Invalid/NaN");
 
             // Apply filtering to each SOC value
             // Allow updates if: first reading (last == 0.0), new value is 0%, or within 2% tolerance
-            if (jk_available) {
+            // Only update if the value is valid (not NaN)
+            if (jk_valid) {
               bool should_update = (id(last_jk_soc) == 0.0 || new_jk_soc == 0.0 || abs(new_jk_soc - id(last_jk_soc)) <= 2.0);
               ESP_LOGI("SOC Filter", "JK: last=%.1f, new=%.1f, diff=%.1f, update=%s",
                       id(last_jk_soc), new_jk_soc, abs(new_jk_soc - id(last_jk_soc)), should_update ? "YES" : "NO");
@@ -299,7 +323,7 @@ canbus:
                 id(last_jk_soc) = new_jk_soc;
               }
             }
-            if (pack1_available) {
+            if (pack1_valid) {
               bool should_update = (id(last_pack1_soc) == 0.0 || new_pack1_soc == 0.0 || abs(new_pack1_soc - id(last_pack1_soc)) <= 2.0);
               ESP_LOGI("SOC Filter", "Pack1: last=%.1f, new=%.1f, diff=%.1f, update=%s",
                       id(last_pack1_soc), new_pack1_soc, abs(new_pack1_soc - id(last_pack1_soc)), should_update ? "YES" : "NO");
@@ -307,7 +331,7 @@ canbus:
                 id(last_pack1_soc) = new_pack1_soc;
               }
             }
-            if (pack2_available) {
+            if (pack2_valid) {
               bool should_update = (id(last_pack2_soc) == 0.0 || new_pack2_soc == 0.0 || abs(new_pack2_soc - id(last_pack2_soc)) <= 2.0);
               ESP_LOGI("SOC Filter", "Pack2: last=%.1f, new=%.1f, diff=%.1f, update=%s",
                       id(last_pack2_soc), new_pack2_soc, abs(new_pack2_soc - id(last_pack2_soc)), should_update ? "YES" : "NO");
@@ -622,8 +646,12 @@ interval:
           ESP_LOGI("main", "No rx can 0x305 reply since 30 sec, Inverter not connected/responding...");
           id(inverter_connected).publish_state(false);
           id(can305Counter) = 0;
+          // Increment CAN failure counter when inverter stops responding
+          id(can_send_failure_count) ++;
         } else {
           id(can305Counter) ++;
+          // Reset failure counter when communication is working
+          id(can_send_failure_count) = 0;
         }
 
         if (id(noBmsUpdateCounter) > 30) {
@@ -632,6 +660,15 @@ interval:
           id(noBmsUpdateCounter) = 0;
         } else {
           id(noBmsUpdateCounter) ++;
+        }
+
+        // Check for persistent CAN communication failures and restart if needed
+        // If inverter has been unresponsive for 30+ cycles (30+ seconds), restart ESP
+        if (id(can_send_failure_count) >= 30) {
+          ESP_LOGE("main", "CAN communication failed for 30+ seconds, restarting ESP to recover...");
+          // Trigger restart using the restart switch
+          auto restart_switch = id(restart_mitm_deye);
+          restart_switch->turn_on();
         }
 
 sensor:
@@ -864,3 +901,4 @@ switch:
 
   - platform: restart
     name: "Restart MitM-Deye"
+    id: "restart_mitm_deye"
