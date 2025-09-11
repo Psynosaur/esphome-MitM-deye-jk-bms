@@ -133,18 +133,11 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
+  - id: last_combined_soc
+    type: int
+    restore_value: yes
+    initial_value: '50'
 
-time:
-# charge battery to 100% each sunday to calibrate cells and BMS
-  - platform: sntp
-    on_time:
-    - seconds: 00
-      minutes: 00
-      hours: 11
-      days_of_week: SUN
-      then:
-        lambda: |-
-          id(force100soc) = true;
 
 # Scripts for notifications
 script:
@@ -371,9 +364,20 @@ canbus:
               count++;
             }
 
-            // If no sources available, use a safe default (50%)
-            // Use proper rounding instead of truncation
-            int combined = (count > 0) ? (int)round(total / count) : 50;
+            // Calculate combined SOC or use last known good value
+            int combined;
+            if (count > 0) {
+              // We have valid sources, calculate new combined SOC
+              combined = (int)round(total / count);
+              // Store this as the last known good value
+              id(last_combined_soc) = combined;
+              // Update Home Assistant sensor
+              id(last_combined_soc_sensor).publish_state(combined);
+            } else {
+              // No valid sources available, use last known good value
+              combined = id(last_combined_soc);
+              ESP_LOGW("SOC Fallback", "No valid SOC sources, using last known value: %d%%", combined);
+            }
             
             // Apply 1% hack to the combined value
             if (combined == 1) {
@@ -389,19 +393,238 @@ canbus:
             
             // Log values for debugging
             ESP_LOGI("SOC Monitoring",
-                    "JK: %.1f%% (%s), Pack1: %.1f%% (%s), Pack2: %.1f%% (%s), Combined: %d%%",
+                    "JK: %.1f%% (%s), Pack1: %.1f%% (%s), Pack2: %.1f%% (%s), Combined: %d%% (%s)",
                     id(last_jk_soc),
                     (id(jk_unavailable_count) < 100) ? "Available" : "Unavailable",
                     id(last_pack1_soc),
                     (id(pack1_unavailable_count) < 100) ? "Available" : "Unavailable",
                     id(last_pack2_soc),
                     (id(pack2_unavailable_count) < 100) ? "Available" : "Unavailable",
-                    combined);
+                    combined,
+                    (count > 0) ? "Calculated" : "Fallback");
             
             // Send the CAN message
             std::vector<uint8_t> data{socByte0, socByte1, x[2], x[3], x[4], x[5], x[6], x[7]};
             id(inverter)->send_data(can_id, false, data);
+    # last used
+    # - can_id: 0x355
+    #   then:
+    #     - lambda: |-
+    #         int soc = ((x[1] << 8) | x[0]);
+    #         id(battery_soc).publish_state(soc);
+    #         int soh = ((x[3] << 8) | x[2]);
+    #         id(battery_soh).publish_state(soh);
+            
+    #         // Read JK BMS SOC (always available locally)
+    #         int new_jk_soc = id(jk_bms_soc).has_state() ? (int)id(jk_bms_soc).state : 0;
+            
+    #         // Apply filtering to JK SOC
+    #         if (id(last_jk_soc) == 0 || new_jk_soc == 0 || abs(new_jk_soc - id(last_jk_soc)) <= 2) {
+    #           id(last_jk_soc) = new_jk_soc;
+    #         }
+            
+    #         // Initialize combined SOC with JK value
+    #         int combined = id(last_jk_soc);
+    #         int available_packs = 1; // Start with JK BMS
+            
+    #         // Check if Pack 1 is available (has state and value is between 0-100)
+    #         bool pack1_available = id(pack_1_soc).has_state() && 
+    #                               (int)id(pack_1_soc).state >= 0 && 
+    #                               (int)id(pack_1_soc).state <= 100;
+            
+    #         if (pack1_available) {
+    #           int new_pack1_soc = (int)id(pack_1_soc).state;
+    #           if (id(last_pack1_soc) == 0 || new_pack1_soc == 0 || abs(new_pack1_soc - id(last_pack1_soc)) <= 2) {
+    #             id(last_pack1_soc) = new_pack1_soc;
+    #           }
+    #           combined += id(last_pack1_soc);
+    #           available_packs++;
+    #         }
+            
+    #         // Check if Pack 2 is available (has state and value is between 0-100)
+    #         bool pack2_available = id(pack_2_soc).has_state() && 
+    #                               (int)id(pack_2_soc).state >= 0 && 
+    #                               (int)id(pack_2_soc).state <= 100;
+            
+    #         if (pack2_available) {
+    #           int new_pack2_soc = (int)id(pack_2_soc).state;
+    #           if (id(last_pack2_soc) == 0 || new_pack2_soc == 0 || abs(new_pack2_soc - id(last_pack2_soc)) <= 2) {
+    #             id(last_pack2_soc) = new_pack2_soc;
+    #           }
+    #           combined += id(last_pack2_soc);
+    #           available_packs++;
+    #         }
+            
+    #         // Calculate average if we have multiple available packs
+    #         if (available_packs > 1) {
+    #           combined = combined / available_packs;
+    #         }
+            
+    #         // Apply 1% hack to the combined value
+    #         if (combined == 1) {
+    #           combined = 2;
+    #         }
+            
+    #         // Update invSoc with the combined value
+    #         id(invSoc) = combined;
+            
+    #         // Prepare SOC bytes for CAN message
+    #         uint8_t socByte0 = combined & 0xFF;
+    #         uint8_t socByte1 = (combined >> 8) & 0xFF;
+            
+    #         // Log values for debugging
+    #         ESP_LOGI("SOC Values", "JK: %d%%, Pack1: %d%% (%s), Pack2: %d%% (%s), Combined: %d%%", 
+    #                 id(last_jk_soc), 
+    #                 id(last_pack1_soc), pack1_available ? "available" : "unavailable",
+    #                 id(last_pack2_soc), pack2_available ? "available" : "unavailable",
+    #                 combined);
+            
+    #         // Send the CAN message
+    #         std::vector<uint8_t> data{socByte0, socByte1, x[2], x[3], x[4], x[5], x[6], x[7]};
+    #         id(inverter)->send_data(can_id, false, data);
 
+    # - can_id: 0x355
+    #   then:
+    #     - lambda: |-
+    #         int soc = ((x[1] << 8) | x[0]);
+    #         id(battery_soc).publish_state(soc);
+    #         int soh = ((x[3] << 8) | x[2]);
+    #         id(battery_soh).publish_state(soh);
+            
+    #         // Read all three SOC values with validation
+    #         int new_jk_soc = id(jk_bms_soc).has_state() ? (int)id(jk_bms_soc).state : 0;
+    #         int new_pack1_soc = id(pack_1_soc).has_state() ? (int)id(pack_1_soc).state : 0;
+    #         int new_pack2_soc = id(pack_2_soc).has_state() ? (int)id(pack_2_soc).state : 0;
+            
+    #         // Validate SOC values are within reasonable range (0-100)
+    #         if (new_jk_soc < 0 || new_jk_soc > 100) {
+    #           ESP_LOGW("SOC", "JK SOC out of range: %d, using last value", new_jk_soc);
+    #           new_jk_soc = id(last_jk_soc);
+    #         }
+    #         if (new_pack1_soc < 0 || new_pack1_soc > 100) {
+    #           ESP_LOGW("SOC", "Pack1 SOC out of range: %d, using last value", new_pack1_soc);
+    #           new_pack1_soc = id(last_pack1_soc);
+    #         }
+    #         if (new_pack2_soc < 0 || new_pack2_soc > 100) {
+    #           ESP_LOGW("SOC", "Pack2 SOC out of range: %d, using last value", new_pack2_soc);
+    #           new_pack2_soc = id(last_pack2_soc);
+    #         }
+            
+    #         // Apply filtering to each SOC value (allow 0% updates)
+    #         if (id(last_jk_soc) == 0 || new_jk_soc == 0 || abs(new_jk_soc - id(last_jk_soc)) <= 2) {
+    #           id(last_jk_soc) = new_jk_soc;
+    #         }
+    #         if (id(last_pack1_soc) == 0 || new_pack1_soc == 0 || abs(new_pack1_soc - id(last_pack1_soc)) <= 2) {
+    #           id(last_pack1_soc) = new_pack1_soc;
+    #         }
+    #         if (id(last_pack2_soc) == 0 || new_pack2_soc == 0 || abs(new_pack2_soc - id(last_pack2_soc)) <= 2) {
+    #           id(last_pack2_soc) = new_pack2_soc;
+    #         }
+            
+    #         // Calculate combined average only with valid values
+    #         int valid_batteries = 0;
+    #         int total_soc = 0;
+            
+    #         if (id(last_jk_soc) >= 0 && id(last_jk_soc) <= 100) {
+    #           total_soc += id(last_jk_soc);
+    #           valid_batteries++;
+    #         }
+    #         if (id(last_pack1_soc) >= 0 && id(last_pack1_soc) <= 100) {
+    #           total_soc += id(last_pack1_soc);
+    #           valid_batteries++;
+    #         }
+    #         if (id(last_pack2_soc) >= 0 && id(last_pack2_soc) <= 100) {
+    #           total_soc += id(last_pack2_soc);
+    #           valid_batteries++;
+    #         }
+            
+    #         int combined = valid_batteries > 0 ? total_soc / valid_batteries : 0;
+            
+    #         // Apply 1% hack to the combined value
+    #         if (combined == 1) {
+    #           combined = 2;
+    #         }
+            
+    #         // Update invSoc with the combined value
+    #         id(invSoc) = combined;
+            
+    #         // Prepare SOC bytes for CAN message
+    #         uint8_t socByte0 = combined & 0xFF;
+    #         uint8_t socByte1 = (combined >> 8) & 0xFF;
+            
+    #         // Log values for debugging
+    #         ESP_LOGI("SOC Values", "JK: %d%%, Pack1: %d%%, Pack2: %d%%, Combined: %d%%", 
+    #                 id(last_jk_soc), id(last_pack1_soc), id(last_pack2_soc), combined);
+            
+    #         // Send the CAN message
+    #         std::vector<uint8_t> data{socByte0, socByte1, x[2], x[3], x[4], x[5], x[6], x[7]};
+    #         id(inverter)->send_data(can_id, false, data);
+
+# - can_id: 0x355
+#   then:
+#     - lambda: |-
+#         int soc = ((x[1] << 8) | x[0]);
+#         id(battery_soc).publish_state(soc);
+#         int soh = ((x[3] << 8) | x[2]);
+#         id(battery_soh).publish_state(soh);
+        
+#         // Read all three SOC values
+#         int new_jk_soc = id(jk_bms_soc).has_state() ? (int)id(jk_bms_soc).state : 0;
+#         int new_pack1_soc = id(pack_1_soc).has_state() ? (int)id(pack_1_soc).state : 0;
+#         int new_pack2_soc = id(pack_2_soc).has_state() ? (int)id(pack_2_soc).state : 0;
+        
+#         // Apply filtering to each SOC value (allow 0% updates)
+#         if (id(last_jk_soc) == 0 || new_jk_soc == 0 || abs(new_jk_soc - id(last_jk_soc)) <= 2) {
+#           id(last_jk_soc) = new_jk_soc;
+#         }
+#         if (id(last_pack1_soc) == 0 || new_pack1_soc == 0 || abs(new_pack1_soc - id(last_pack1_soc)) <= 2) {
+#           id(last_pack1_soc) = new_pack1_soc;
+#         }
+#         if (id(last_pack2_soc) == 0 || new_pack2_soc == 0 || abs(new_pack2_soc - id(last_pack2_soc)) <= 2) {
+#           id(last_pack2_soc) = new_pack2_soc;
+#         }
+        
+#         // Calculate combined average
+#         int combined = (id(last_jk_soc) + id(last_pack1_soc) + id(last_pack2_soc)) / 3;
+        
+#         // Apply 1% hack to the combined value
+#         if (combined == 1) {
+#           combined = 2;
+#         }
+        
+#         // Update invSoc with the combined value
+#         id(invSoc) = combined;
+        
+#         // Prepare SOC bytes for CAN message
+#         uint8_t socByte0 = combined & 0xFF;
+#         uint8_t socByte1 = (combined >> 8) & 0xFF;
+        
+#         // Log values for debugging
+#         ESP_LOGI("SOC Values", "JK: %d%%, Pack1: %d%%, Pack2: %d%%, Combined: %d%%", 
+#                 id(last_jk_soc), id(last_pack1_soc), id(last_pack2_soc), combined);
+        
+#         // Send the CAN message
+#         std::vector<uint8_t> data{socByte0, socByte1, x[2], x[3], x[4], x[5], x[6], x[7]};
+#         id(inverter)->send_data(can_id, false, data);
+#            ESP_LOGI("canid 0x355:", "SoC %d %, SoH %d %",soc, soh );
+# // Update globals only if:
+# //   - The global is 0 (initialization) OR
+# //   - The new reading is non-zero (to avoid error updates) AND the difference is within 2%.
+# if ( id(last_invSoc) == 0 || ( new_invSoc != 0 && abs(new_invSoc - id(last_invSoc)) <= 2 ) ) {
+#   id(last_invSoc) = new_invSoc;
+# }
+# if ( id(last_jk_soc) == 0 || ( new_jk_soc != 0 && abs(new_jk_soc - id(last_jk_soc)) <= 2 ) ) {
+#   id(last_jk_soc) = new_jk_soc;
+# } 
+# // Log the filtered (stored) values.
+# ESP_LOGI("Filtered SoC", "Stored Deye: %d, Stored jk_bms_soc: %d", id(last_invSoc), id(last_jk_soc));
+
+# // Compute the average from the stored values.
+# int combined = ( id(last_invSoc) + id(last_jk_soc) ) / 2;
+
+# // Update socByte0 and socByte1 based on the average.
+# socByte0 = combined & 0xFF;
+# socByte1 = (combined >> 8) & 0xFF;
     - can_id: 0x356
       then:
         - lambda: |-
@@ -766,6 +989,16 @@ sensor:
     device_class: 'battery'
     state_class: 'measurement'
     accuracy_decimals: 0
+
+  - platform: template
+    name: "Last Combined SoC"
+    id: "last_combined_soc_sensor"
+    unit_of_measurement: '%'
+    device_class: 'battery'
+    state_class: 'measurement'
+    accuracy_decimals: 0
+    lambda: |-
+      return id(last_combined_soc);
 
 # Calculated power
   - platform: template
