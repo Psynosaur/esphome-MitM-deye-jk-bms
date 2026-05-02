@@ -22,7 +22,7 @@ esphome:
 # esp32:
 #   board: featheresp32
 #   framework:
-#     type: arduino
+#     type: arduino 
 
 esp32:
 # ESP32 C6
@@ -31,20 +31,15 @@ esp32:
   variant: esp32c6
   framework:
     type: esp-idf
-    version: "5.2.2"
-    platform_version: 6.6.0
+    version: "5.5.4"
+    platform_version: https://github.com/pioarduino/platform-espressif32/releases/download/55.03.38/platform-espressif32.zip
     sdkconfig_options:
       CONFIG_OPENTHREAD_ENABLED: n
       CONFIG_ENABLE_WIFI_STATION: y
       CONFIG_USE_MINIMAL_MDNS: y
       CONFIG_ESPTOOLPY_FLASHSIZE_8MB: y
       CONFIG_ESP_CONSOLE_USB_CDC: y
-      
-# for ESP32 C6 only because of two CAN-busses
-external_components:
-  - source: github://Adminius/esphome@multiple_can_esp32
-    components: [ esp32_can ]
-#    refresh: 60s
+
 # Enable logging
 logger:
   baud_rate: 0 # disable UART logger
@@ -92,10 +87,6 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
-  - id: force100soc
-    type: bool
-    restore_value: no
-    initial_value: 'false'
   - id: saveRcv
     type: float
     restore_value: no
@@ -137,6 +128,14 @@ globals:
     type: int
     restore_value: yes
     initial_value: '50'
+  - id: pack_1_soc_can
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: pack_2_soc_can
+    type: float
+    restore_value: no
+    initial_value: '0.0'
 
 
 # Scripts for notifications
@@ -264,7 +263,6 @@ canbus:
             
             id(inverter)->send_data(can_id, false, data);
             //ESP_LOGI("canid 0x351:", "U_max: %.1f V, I_charge %d A, I_discharge: %d A", u_max, chargeCurrent / 10, dischargeCurrent / 10);
-
     - can_id: 0x355
       then:
         - lambda: |-
@@ -273,15 +271,25 @@ canbus:
             int soh = ((x[3] << 8) | x[2]);
             id(battery_soh).publish_state(soh);
             
-            // Track availability of each SOC source
-            bool jk_available = id(jk_bms_soc).has_state();
-            bool pack1_available = id(pack_1_soc).has_state();
-            bool pack2_available = id(pack_2_soc).has_state();
+            // SOC Sources:
+            // 1. JK BMS: From Home Assistant (external BMS)
+            // 2. Pack 1: Direct from CAN frame 0x150
+            // 3. Pack 2: Direct from CAN frame 0x151
 
-            // Read available SOC values as floats with fallback to last known values
-            float new_jk_soc = jk_available ? id(jk_bms_soc).state : id(last_jk_soc);
-            float new_pack1_soc = pack1_available ? id(pack_1_soc).state : id(last_pack1_soc);
-            float new_pack2_soc = pack2_available ? id(pack_2_soc).state : id(last_pack2_soc);
+            float bms_can_soc = soc;  // The SOC from this CAN frame (0x355)
+
+            // JK BMS SOC from Home Assistant (when available)
+            bool jk_ha_available = id(jk_bms_soc).has_state() && !isnan(id(jk_bms_soc).state);
+            float new_jk_soc = jk_ha_available ? id(jk_bms_soc).state : id(last_jk_soc);
+            bool jk_available = jk_ha_available;
+
+            // Pack 1 SOC from direct CAN frame 0x150 (always available when received)
+            float new_pack1_soc = id(pack_1_soc_can);
+            bool pack1_available = (id(pack_1_soc_can) > 0.0);  // Available if we've received CAN frame
+
+            // Pack 2 SOC from direct CAN frame 0x151 (always available when received)
+            float new_pack2_soc = id(pack_2_soc_can);
+            bool pack2_available = (id(pack_2_soc_can) > 0.0);  // Available if we've received CAN frame
 
             // Check for NaN values and mark as unavailable if found
             bool jk_valid = jk_available && !isnan(new_jk_soc);
@@ -310,13 +318,14 @@ canbus:
             // Log raw values for debugging
             ESP_LOGI("SOC Raw Values",
                     "JK: %.1f%% (%s), Pack1: %.1f%% (%s), Pack2: %.1f%% (%s)",
-                    new_jk_soc, jk_valid ? "Valid" : "Invalid/NaN",
-                    new_pack1_soc, pack1_valid ? "Valid" : "Invalid/NaN",
-                    new_pack2_soc, pack2_valid ? "Valid" : "Invalid/NaN");
+                    new_jk_soc, jk_ha_available ? "HA" : "Unavailable",
+                    new_pack1_soc, pack1_available ? "CAN-0x150" : "Unavailable",
+                    new_pack2_soc, pack2_available ? "CAN-0x151" : "Unavailable");
 
             // Apply filtering to each SOC value
             // Allow updates if: first reading (last == 0.0), new value is 0%, or within 2% tolerance
             // Only update if the value is valid (not NaN)
+            // Note: We still allow 0% readings for accurate low battery detection, but protect at final output
             if (jk_valid) {
               bool should_update = (id(last_jk_soc) == 0.0 || new_jk_soc == 0.0 || abs(new_jk_soc - id(last_jk_soc)) <= 2.0);
               ESP_LOGI("SOC Filter", "JK: last=%.1f, new=%.1f, diff=%.1f, update=%s",
@@ -369,20 +378,27 @@ canbus:
             if (count > 0) {
               // We have valid sources, calculate new combined SOC
               combined = (int)round(total / count);
-              // Store this as the last known good value
-              id(last_combined_soc) = combined;
-              // Update Home Assistant sensor
-              id(last_combined_soc_sensor).publish_state(combined);
+              // Apply minimum SOC protection before storing
+              int protected_combined = (combined <= 1) ? 2 : combined;
+              // Store the protected value as the last known good value
+              id(last_combined_soc) = protected_combined;
+              // Update Home Assistant sensor with protected value
+              id(last_combined_soc_sensor).publish_state(protected_combined);
+              // Use the protected value for CAN transmission
+              combined = protected_combined;
             } else {
               // No valid sources available, use last known good value
               combined = id(last_combined_soc);
               ESP_LOGW("SOC Fallback", "No valid SOC sources, using last known value: %d%%", combined);
+              // Ensure fallback value is also protected
+              if (combined <= 1) {
+                ESP_LOGW("SOC Protection", "Fallback SOC was %d%%, forcing to 2%% to prevent inverter trip", combined);
+                combined = 2;
+                id(last_combined_soc) = 2;  // Update stored value too
+              }
             }
             
-            // Apply 1% hack to the combined value
-            if (combined == 1) {
-              combined = 2;
-            }
+
             
             // Update invSoc with the combined value
             id(invSoc) = combined;
@@ -715,10 +731,10 @@ canbus:
             //std::vector< uint8_t > data{0x50, 0x59, 0x4C, 0x4F, 0x4E, 0x00, 0x00, 0x00};
             id(inverter)->send_data(can_id, false, x);
             //ESP_LOGI("canid 0x35E:", "%02x %02x %02x %02x %02x %02x %02x %02x", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]); 
-    - can_id: 0x356
-      then:
-        - lambda: |-
-            id(inverter)->send_data(can_id, false, x);
+    # - can_id: 0x356
+    #   then:
+    #     - lambda: |-
+    #         id(inverter)->send_data(can_id, false, x);
     - can_id: 0x361
       then:
         - lambda: |-
@@ -775,14 +791,50 @@ canbus:
         - lambda: |-
             id(inverter)->send_data(can_id, false, x);  
 
-    - can_id: 0x150 
+    - can_id: 0x150
       then:
         - lambda: |-
+            // Extract Pack 1 data from CAN frame
+            float voltage = ((x[1] << 8) | x[0]) / 10.0;
+            float current = ((x[3] << 8) | x[2]) / 10.0;
+            if(x[3] > 0x80) current = uint16_t(~((x[3] << 8) | x[2]) + 1) / -10.0;
+            float soc = ((x[5] << 8) | x[4]) / 10.0;
+            float soh = ((x[7] << 8) | x[6]) / 10.0;
+
+            // Store Pack 1 SOC for use in averaging
+            id(pack_1_soc_can) = soc;
+
+            // Publish to sensors
+            id(pack_1_voltage).publish_state(voltage);
+            id(pack_1_current).publish_state(current);
+            id(pack_1_soc).publish_state(soc);
+            id(pack_1_soh).publish_state(soh);
+
+            ESP_LOGI("Pack 1 CAN", "V: %.1fV, I: %.1fA, SOC: %.1f%%, SOH: %.1f%%", voltage, current, soc, soh);
+
             id(inverter)->send_data(can_id, false, x);
 
-    - can_id: 0x151 
+    - can_id: 0x151
       then:
         - lambda: |-
+            // Extract Pack 2 data from CAN frame
+            float voltage = ((x[1] << 8) | x[0]) / 10.0;
+            float current = ((x[3] << 8) | x[2]) / 10.0;
+            if(x[3] > 0x80) current = uint16_t(~((x[3] << 8) | x[2]) + 1) / -10.0;
+            float soc = ((x[5] << 8) | x[4]) / 10.0;
+            float soh = ((x[7] << 8) | x[6]) / 10.0;
+
+            // Store Pack 2 SOC for use in averaging
+            id(pack_2_soc_can) = soc;
+
+            // Publish to sensors
+            id(pack_2_voltage).publish_state(voltage);
+            id(pack_2_current).publish_state(current);
+            id(pack_2_soc).publish_state(soc);
+            id(pack_2_soh).publish_state(soh);
+
+            ESP_LOGI("Pack 2 CAN", "V: %.1fV, I: %.1fA, SOC: %.1f%%, SOH: %.1f%%", voltage, current, soc, soh);
+
             id(inverter)->send_data(can_id, false, x);
 
     - can_id: 0x200 
@@ -808,14 +860,6 @@ canbus:
         - lambda: |-
             id(inverter)->send_data(can_id, false, x);
     - can_id: 0x401 
-      then:
-        - lambda: |-
-            id(inverter)->send_data(can_id, false, x);
-    - can_id: 0x110 
-      then:
-        - lambda: |-
-            id(inverter)->send_data(can_id, false, x);
-    - can_id: 0x111 
       then:
         - lambda: |-
             id(inverter)->send_data(can_id, false, x);
@@ -878,11 +922,11 @@ interval:
           ESP_LOGI("main", "No rx can 0x305 reply since 30 sec, Inverter not connected/responding...");
           id(inverter_connected).publish_state(false);
           id(can305Counter) = 0;
-          // Increment CAN failure counter when inverter stops responding
+          // Accumulate failure seconds while inverter is unresponsive
           id(can_send_failure_count) ++;
         } else {
           id(can305Counter) ++;
-          // Reset failure counter when communication is working
+          // Inverter responding: reset failure counter
           id(can_send_failure_count) = 0;
         }
 
@@ -894,17 +938,11 @@ interval:
           id(noBmsUpdateCounter) ++;
         }
 
-        // Check for persistent CAN communication failures and restart if needed
-        // If inverter has been unresponsive for 30+ cycles (30+ seconds), restart ESP
+        // Restart after inverter unresponsive for ~30 consecutive 30s windows (~900s total)
         if (id(can_send_failure_count) >= 30) {
-          ESP_LOGE("main", "CAN communication failed for 30+ seconds, restarting ESP to recover...");
-
-          // Send Telegram notification before restart
+          ESP_LOGE("main", "CAN communication failed for 900+ seconds, restarting ESP to recover...");
+          id(can_send_failure_count) = 0;
           id(can_failure_notification).execute();
-
-          // Small delay to ensure notification is sent before restart
-          delay(2000);
-
           // Trigger restart using the restart switch
           auto restart_switch = id(restart_mitm_deye);
           restart_switch->turn_on();
@@ -916,15 +954,71 @@ sensor:
     id: "jk_bms_soc"
     entity_id: sensor.jk_bms_state_of_charge
 
-  - platform: homeassistant
-    name: "pack_1_soc"
-    id: "pack_1_soc"
-    entity_id: sensor.deye_pcs_can_bus_pack_1_soc
+# Pack 1 sensors from CAN frame 0x150
+  - platform: template
+    name: "Pack 1 Voltage"
+    id: "pack_1_voltage"
+    unit_of_measurement: 'V'
+    device_class: 'voltage'
+    state_class: 'measurement'
+    accuracy_decimals: 1
 
-  - platform: homeassistant
-    name: "pack_2_soc"
+  - platform: template
+    name: "Pack 1 Current"
+    id: "pack_1_current"
+    unit_of_measurement: 'A'
+    device_class: 'current'
+    state_class: 'measurement'
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Pack 1 SOC"
+    id: "pack_1_soc"
+    unit_of_measurement: '%'
+    device_class: 'battery'
+    state_class: 'measurement'
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Pack 1 SOH"
+    id: "pack_1_soh"
+    unit_of_measurement: '%'
+    device_class: 'battery'
+    state_class: 'measurement'
+    accuracy_decimals: 1
+
+# Pack 2 sensors from CAN frame 0x151
+  - platform: template
+    name: "Pack 2 Voltage"
+    id: "pack_2_voltage"
+    unit_of_measurement: 'V'
+    device_class: 'voltage'
+    state_class: 'measurement'
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Pack 2 Current"
+    id: "pack_2_current"
+    unit_of_measurement: 'A'
+    device_class: 'current'
+    state_class: 'measurement'
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Pack 2 SOC"
     id: "pack_2_soc"
-    entity_id: sensor.deye_pcs_can_bus_pack_2_soc
+    unit_of_measurement: '%'
+    device_class: 'battery'
+    state_class: 'measurement'
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Pack 2 SOH"
+    id: "pack_2_soh"
+    unit_of_measurement: '%'
+    device_class: 'battery'
+    state_class: 'measurement'
+    accuracy_decimals: 1
 
   - platform: template
     name: "Battery voltage"
@@ -1068,7 +1162,7 @@ number:
     name: "Charge voltage offset"
     id: "charge_voltage_offset"
     unit_of_measurement: 'V'
-    device_class: 'current'
+    device_class: 'voltage'
     max_value: 1.0
     min_value: 0.0
     step: 0.1
