@@ -1,0 +1,629 @@
+# MitM Deye - Deye Battery Only (no JK BMS)
+# Intercepts CAN bus between Deye BMS and inverter
+# Supports variable number of Deye battery packs
+#
+# Edit PACK_COUNT below, or use add_packs.py to regenerate:
+#   python add_packs.py --packs 4
+#
+# PACK_COUNT: {{ PACK_COUNT }}
+
+substitutions:
+  name: mitm-deye
+  device_description: "MitM Adapter For Deye Communication Protocol (Battery Only)"
+
+# voltage offset for inverter to compensate voltage drop in cabling
+  offset_voltage: "0.4"
+
+# BMS specific:
+  charge_current: "200"
+  discharge_current: "200"
+
+
+esphome:
+  name: ${name}
+  friendly_name: ${name}
+  comment: ${device_description}
+
+esp32:
+# ESP32 C6
+  board: esp32-c6-devkitc-1
+  flash_size: 8MB
+  variant: esp32c6
+  framework:
+    type: esp-idf
+    version: "5.5.4"
+    platform_version: https://github.com/pioarduino/platform-espressif32/releases/download/55.03.38/platform-espressif32.zip
+    sdkconfig_options:
+      CONFIG_OPENTHREAD_ENABLED: n
+      CONFIG_ENABLE_WIFI_STATION: y
+      CONFIG_USE_MINIMAL_MDNS: y
+      CONFIG_ESPTOOLPY_FLASHSIZE_8MB: y
+      CONFIG_ESP_CONSOLE_USB_CDC: y
+
+# Enable logging
+logger:
+  baud_rate: 0 # disable UART logger
+  level: INFO
+
+# Enable webserver
+web_server:
+  port: 80
+  auth:
+    username: admin
+    password: !secret wifi_password
+  version: 3
+  log: true
+  ota: false
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret api_key_mit
+
+ota:
+  - platform: esphome
+    password: !secret ota_key_mit
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+
+globals:
+  - id: can305Counter
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: noBmsUpdateCounter
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: saveRcv
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: invSoc
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_invSoc
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  - id: can_send_failure_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_combined_soc
+    type: int
+    restore_value: yes
+    initial_value: '50'
+{{ PACK_GLOBALS }}
+
+# Scripts for notifications
+script:
+  - id: can_failure_notification
+    then:
+      - homeassistant.service:
+          service: notify.send_message
+          data:
+            message: "MitM ESP restarted due to CAN failure."
+          target:
+            entity_id: notify.HomeA55Bot
+
+canbus:
+
+# inverter
+  - platform: esp32_can
+    id: inverter
+    tx_pin: GPIO01
+    rx_pin: GPIO00
+    can_id: 100
+    bit_rate: 500KBPS
+    on_frame:
+    - can_id: 0x305
+      then:
+        - lambda: |-
+            id(can305Counter) = 0;
+            id(inverter_connected).publish_state(true);
+
+# BMS
+  - platform: esp32_can
+    id: bms
+    tx_pin: GPIO02
+    rx_pin: GPIO03
+    can_id: 200
+    bit_rate: 500KBPS
+    on_frame:
+    # Battery charging voltage and current limits
+    - can_id: 0x351
+      then:
+        - lambda: |-
+            float u_max = ((x[1] << 8) | x[0]) / 10.0;
+            id(battery_charge_voltage).publish_state(u_max);
+
+            // assume, that the highest voltage is RCV
+            if(id(saveRcv) < u_max) id(saveRcv) = id(charge_voltage_override).state;
+
+            uint16_t chargeCurrent = ((x[3] << 8) | x[2]) / 10;
+            id(battery_charge_current_limit).publish_state(chargeCurrent);
+
+            uint16_t dischargeCurrent = ((x[5] << 8) | x[4]) / 10;
+            id(battery_discharge_current_limit).publish_state(dischargeCurrent);
+
+            id(noBmsUpdateCounter) = 0;
+            id(bms_connected).publish_state(true);
+
+            uint8_t canMessage[] = {0x00, 0x00, x[2], x[3], x[4], x[5], x[6], x[7]};
+
+            uint16_t chargeVoltage = (uint16_t)((id(charge_voltage_override).state - id(charge_voltage_offset).state) * 10);
+            canMessage[0] = chargeVoltage & 0xFF;
+            canMessage[1] = chargeVoltage >> 8;
+
+            // Lower charge limit if slider value is lower than chargeCurrent
+            if(id(set_charge_current_limit).state <= chargeCurrent) {
+              chargeCurrent = (uint16_t)(id(set_charge_current_limit).state) * 10;
+              canMessage[2] = (uint8_t)(chargeCurrent & 0xFF);
+              canMessage[3] = (uint8_t)(chargeCurrent >> 8);
+            }
+
+            // Modify charge current sent to inverter if override is enabled
+            if (id(use_charge_current_override).state) {
+              uint16_t oc = (uint16_t)(id(set_charge_current_limit).state * 10);
+              canMessage[2] = oc & 0xFF;
+              canMessage[3] = oc >> 8;
+              ESP_LOGI("0x371", "Override active - sending %u (raw)", oc);
+            }
+
+            // Set charge current to 0
+            if(!id(charging_allowed).state || !id(set_charging_allowed).state) {
+              canMessage[2] = 0x00;
+              canMessage[3] = 0x00;
+            }
+
+            // Lower discharge limit if slider value is lower than dischargeCurrent
+            if(id(set_discharge_current_limit).state <= dischargeCurrent) {
+                dischargeCurrent = (uint16_t)(id(set_discharge_current_limit).state) * 10;
+                canMessage[4] = (uint8_t)(dischargeCurrent & 0xFF);
+                canMessage[5] = (uint8_t)(dischargeCurrent >> 8);
+            }
+
+            std::vector< uint8_t > data{canMessage[0], canMessage[1], canMessage[2], canMessage[3], canMessage[4], canMessage[5], canMessage[6], canMessage[7]};
+
+            id(inverter)->send_data(can_id, false, data);
+
+    - can_id: 0x355
+      then:
+        - lambda: |-
+            int soc = ((x[1] << 8) | x[0]);
+            id(battery_soc).publish_state(soc);
+            int soh = ((x[3] << 8) | x[2]);
+            id(battery_soh).publish_state(soh);
+
+{{ SOC_AVERAGING }}
+
+    - can_id: 0x356
+      then:
+        - lambda: |-
+            float voltage = ((x[1] << 8) | x[0]) / 100.0;
+            id(battery_voltage).publish_state(voltage);
+            float current = ((x[3] << 8) | x[2]) / 10.0;
+            if(x[3] > 0x80) current = uint16_t(~((x[3] << 8) | x[2]) + 1) / -10.0;
+            id(battery_current).publish_state(current);
+            float temperature = ((x[5] << 8) | x[4]) / 10;
+            id(battery_temperature).publish_state(temperature);
+            id(battery_power).publish_state(voltage * current);
+            id(inverter)->send_data(can_id, false, x);
+
+    - can_id: 0x35C
+      then:
+         - lambda: |-
+            id(charging_allowed).publish_state(x[0] & 0x80);
+            id(discharging_allowed).publish_state(x[0] & 0x40);
+            id(request_force_charge_1).publish_state(x[0] & 0x20);
+            id(request_force_charge_2).publish_state(x[0] & 0x10);
+            id(request_full_charge).publish_state(x[0] & 0x08);
+
+            uint8_t message = 0x00;
+
+            if(id(charging_allowed).state && id(set_charging_allowed).state) message |= 0x80;
+            if(id(discharging_allowed).state && id(set_discharging_allowed).state) message |= 0x40;
+
+            if(id(block_bms_force_charge_1).state) {
+              if(id(override_force_charge_1).state) message |= 0x20;
+            } else {
+              if(id(override_force_charge_1).state || (x[0] & 0x20)) message |= 0x20;
+            }
+
+            if(id(block_bms_force_charge_2).state) {
+              if(id(override_force_charge_2).state) message |= 0x10;
+            } else {
+              if(id(override_force_charge_2).state || (x[0] & 0x10)) message |= 0x10;
+            }
+
+            if(x[0] & 0x08) message |= 0x08;
+
+            if(message != 0 || (x[1] != 0 || x[2] != 0 || x[3] != 0 || x[4] != 0 || x[5] != 0 || x[6] != 0 || x[7] != 0)) {
+              std::vector< uint8_t > data{message, x[1], x[2], x[3], x[4], x[5], x[6], x[7]};
+              id(inverter)->send_data(can_id, false, data);
+            }
+
+    - can_id: 0x359
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+
+    - can_id: 0x35E
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+
+    - can_id: 0x361
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+
+    - can_id: 0x363
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+
+    - can_id: 0x364
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+
+    - can_id: 0x371
+      then:
+        - lambda: |-
+            uint8_t b0 = x[0];
+            uint8_t b1 = x[1];
+            if (id(use_charge_current_override).state) {
+              uint16_t oc = (uint16_t)(id(set_charge_current_limit).state * 10);
+              b0 = oc & 0xFF;
+              b1 = oc >> 8;
+              ESP_LOGI("0x371", "Override active - sending %u (raw)", oc);
+            }
+            std::vector<uint8_t> data = {b0, b1, x[2], x[3], x[4], x[5], x[6], x[7]};
+            id(inverter)->send_data(can_id, false, data);
+
+    - can_id: 0x110
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x111
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+
+{{ PACK_HANDLERS }}
+
+    - can_id: 0x200
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+
+    - can_id: 0x201
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+
+    - can_id: 0x250
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x251
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x400
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x401
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x500
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x501
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x550
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x551
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x600
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x601
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x650
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x651
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x700
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x701
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x750
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+    - can_id: 0x751
+      then:
+        - lambda: |-
+            id(inverter)->send_data(can_id, false, x);
+
+# send messages
+interval:
+  - interval: 1s
+    then:
+      lambda: |-
+        if (id(can305Counter) > 30) {
+          ESP_LOGI("main", "No rx can 0x305 reply since 30 sec, Inverter not connected/responding...");
+          id(inverter_connected).publish_state(false);
+          id(can305Counter) = 0;
+          id(can_send_failure_count) ++;
+        } else {
+          id(can305Counter) ++;
+          id(can_send_failure_count) = 0;
+        }
+
+        if (id(noBmsUpdateCounter) > 30) {
+          ESP_LOGI("main", "No rx from BMS since 30 sec, not connected/responding...");
+          id(bms_connected).publish_state(false);
+          id(noBmsUpdateCounter) = 0;
+        } else {
+          id(noBmsUpdateCounter) ++;
+        }
+
+        if (id(can_send_failure_count) >= 30) {
+          ESP_LOGE("main", "CAN communication failed for 900+ seconds, restarting ESP to recover...");
+          id(can_send_failure_count) = 0;
+          id(can_failure_notification).execute();
+          auto restart_switch = id(restart_mitm_deye);
+          restart_switch->turn_on();
+        }
+
+sensor:
+{{ PACK_SENSORS }}
+
+  - platform: template
+    name: "Battery voltage"
+    id: "battery_voltage"
+    unit_of_measurement: 'V'
+    device_class: 'voltage'
+    state_class: 'measurement'
+    accuracy_decimals: 2
+
+  - platform: template
+    name: "Battery current"
+    id: "battery_current"
+    unit_of_measurement: 'A'
+    device_class: 'current'
+    state_class: 'measurement'
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Battery temperature"
+    id: "battery_temperature"
+    unit_of_measurement: 'C'
+    device_class: 'temperature'
+    state_class: 'measurement'
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Battery charge voltage"
+    id: "battery_charge_voltage"
+    unit_of_measurement: 'V'
+    device_class: 'voltage'
+    state_class: 'measurement'
+    accuracy_decimals: 2
+
+  - platform: template
+    name: "Battery charge current limit"
+    id: "battery_charge_current_limit"
+    unit_of_measurement: 'A'
+    device_class: 'current'
+    state_class: 'measurement'
+    accuracy_decimals: 0
+
+  - platform: template
+    name: "Battery discharge current limit"
+    id: "battery_discharge_current_limit"
+    unit_of_measurement: 'A'
+    device_class: 'current'
+    state_class: 'measurement'
+    accuracy_decimals: 0
+
+  - platform: template
+    name: "Battery SoC"
+    id: "battery_soc"
+    unit_of_measurement: '%'
+    device_class: 'battery'
+    state_class: 'measurement'
+    accuracy_decimals: 0
+
+  - platform: template
+    name: "Battery SoH"
+    id: "battery_soh"
+    unit_of_measurement: '%'
+    device_class: 'battery'
+    state_class: 'measurement'
+    accuracy_decimals: 0
+
+  - platform: template
+    name: "Last Combined SoC"
+    id: "last_combined_soc_sensor"
+    unit_of_measurement: '%'
+    device_class: 'battery'
+    state_class: 'measurement'
+    accuracy_decimals: 0
+    lambda: |-
+      return id(last_combined_soc);
+
+  - platform: template
+    name: "Battery power"
+    id: "battery_power"
+    unit_of_measurement: 'W'
+    device_class: 'power'
+    state_class: 'measurement'
+    accuracy_decimals: 0
+
+binary_sensor:
+  - platform: template
+    name: "Charging allowed"
+    id: "charging_allowed"
+
+  - platform: template
+    name: "Discharging allowed"
+    id: "discharging_allowed"
+
+  - platform: template
+    name: "Request force charge 1"
+    id: "request_force_charge_1"
+
+  - platform: template
+    name: "Request force charge 2"
+    id: "request_force_charge_2"
+
+  - platform: template
+    name: "Request full charge"
+    id: "request_full_charge"
+
+  - platform: template
+    name: "Inverter connected"
+    id: "inverter_connected"
+
+  - platform: template
+    name: "BMS connected"
+    id: "bms_connected"
+
+number:
+  - platform: template
+    name: "Set charge current limit"
+    id: "set_charge_current_limit"
+    unit_of_measurement: 'A'
+    device_class: 'current'
+    max_value: ${charge_current}
+    min_value: 1
+    step: 1
+    optimistic: True
+    restore_value: True
+
+  - platform: template
+    name: "Set discharge current limit"
+    id: "set_discharge_current_limit"
+    unit_of_measurement: 'A'
+    device_class: 'current'
+    max_value: ${discharge_current}
+    min_value: 0
+    step: 1
+    optimistic: True
+    restore_value: True
+
+  - platform: template
+    name: "Charge voltage offset"
+    id: "charge_voltage_offset"
+    unit_of_measurement: 'V'
+    device_class: 'voltage'
+    max_value: 1.0
+    min_value: 0.0
+    step: 0.1
+    optimistic: True
+    restore_value: True
+
+  - platform: template
+    name: "Charge voltage override"
+    id: "charge_voltage_override"
+    unit_of_measurement: 'V'
+    device_class: 'voltage'
+    max_value: 58.4
+    min_value: 53.0
+    step: 0.1
+    optimistic: True
+    restore_value: True
+
+switch:
+  - platform: template
+    name: "Use Charge Current Override"
+    id: use_charge_current_override
+    optimistic: True
+    restore_mode: ALWAYS_OFF
+
+  - platform: template
+    name: "Block BMS Force Charge 1"
+    id: "block_bms_force_charge_1"
+    optimistic: True
+    restore_mode: ALWAYS_OFF
+
+  - platform: template
+    name: "Block BMS Force Charge 2"
+    id: "block_bms_force_charge_2"
+    optimistic: True
+    restore_mode: ALWAYS_OFF
+
+  - platform: template
+    name: "Override Force Charge 1"
+    id: "override_force_charge_1"
+    optimistic: True
+    restore_mode: ALWAYS_OFF
+
+  - platform: template
+    name: "Override Force Charge 2"
+    id: "override_force_charge_2"
+    optimistic: True
+    restore_mode: ALWAYS_OFF
+
+  - platform: template
+    name: "Set charging allowed"
+    id: "set_charging_allowed"
+    optimistic: True
+    restore_mode: RESTORE_DEFAULT_ON
+
+  - platform: template
+    name: "Set discharging allowed"
+    id: "set_discharging_allowed"
+    optimistic: True
+    restore_mode: RESTORE_DEFAULT_ON
+
+  - platform: template
+    name: "Set charge request"
+    id: "set_charge_request"
+    optimistic: True
+    restore_mode: ALWAYS_OFF
+
+  - platform: template
+    name: "Charge to 90% only"
+    id: "charge_to_90_only"
+    optimistic: True
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: template
+    name: "SoC 100% (RCV+RFV) control"
+    id: "soc_100_rcv_rfv_control"
+    optimistic: True
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: restart
+    name: "Restart MitM-Deye"
+    id: "restart_mitm_deye"
